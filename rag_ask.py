@@ -5,8 +5,31 @@ import ollama
 import chromadb
 import os
 from sentence_transformers import CrossEncoder
+from rank_bm25 import BM25Okapi
 
 reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+# Cached BM25 index — rebuilt when the collection changes
+_bm25_cache = {"key": None, "bm25": None, "corpus": None}
+
+def get_bm25(collection):
+    key = collection.count()
+    if _bm25_cache["key"] != key:
+        result = collection.get(include=["documents"])
+        corpus = result["documents"]
+        tokenized = [doc.lower().split() for doc in corpus]
+        _bm25_cache["key"] = key
+        _bm25_cache["bm25"] = BM25Okapi(tokenized)
+        _bm25_cache["corpus"] = corpus
+    return _bm25_cache["bm25"], _bm25_cache["corpus"]
+
+def reciprocal_rank_fusion(rankings, k=60):
+    """Merge multiple ranked lists of docs into a single scored dict."""
+    scores = {}
+    for ranked_list in rankings:
+        for rank, doc in enumerate(ranked_list):
+            scores[doc] = scores.get(doc, 0) + 1 / (k + rank + 1)
+    return scores
 
 # Get available models from Ollama
 def get_available_models():
@@ -41,28 +64,37 @@ def select_model(model_type):
         except ValueError:
             print("Invalid input. Please enter a number.")
 
-# Retrieve and rerank relevant chunks
-def search(collection, question):
+# Retrieve and rerank relevant chunks using hybrid search (vector + BM25)
+def search(collection, question, top_n=5):
+    # --- Vector retrieval ---
     q_emb = ollama.embed(
         model="nomic-embed-text",
         input=question
     ).embeddings[0]
 
-    # Stage 1: broad retrieval
-    results = collection.query(
+    vec_results = collection.query(
         query_embeddings=[q_emb],
         n_results=20
     )
+    vec_ranked = vec_results["documents"][0]
 
-    candidates = results["documents"][0]
+    # --- BM25 retrieval ---
+    bm25, corpus = get_bm25(collection)
+    tokens = question.lower().split()
+    bm25_scores = bm25.get_scores(tokens)
+    bm25_ranked = [corpus[i] for i in sorted(range(len(bm25_scores)),
+                                              key=lambda i: bm25_scores[i],
+                                              reverse=True)[:20]]
 
-    # Stage 2: cross-encoder reranking
+    # --- Reciprocal Rank Fusion ---
+    fused = reciprocal_rank_fusion([vec_ranked, bm25_ranked])
+    candidates = sorted(fused, key=fused.get, reverse=True)[:30]
+
+    # --- Cross-encoder reranking ---
     pairs = [[question, doc] for doc in candidates]
     scores = reranker.predict(pairs)
     ranked = sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)
-    top_docs = [doc for _, doc in ranked[:5]]
-
-    return top_docs
+    return [doc for _, doc in ranked[:top_n]]
 
 # Query RAG
 def ask(collection, question, chat_model):
