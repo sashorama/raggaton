@@ -1,0 +1,583 @@
+import ollama
+from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
+import chromadb
+import os
+from tqdm import tqdm
+import readline
+import atexit
+from pathlib import Path
+import glob
+
+DB_FOLDER = "vector_db"
+EMBEDDING_MODEL = "nomic-embed-text"
+
+# Active collection name — changed at runtime by /db
+current_db = "docs"
+
+def docs_folder():
+    """Each DB keeps its documents in a folder with the same name."""
+    return current_db
+
+
+# --- Document loading ---
+
+_converter = None
+
+def _get_converter():
+    """Lazy-load the docling DocumentConverter (loads ML models once)."""
+    global _converter
+    if _converter is None:
+        from docling.document_converter import DocumentConverter
+        from docling.datamodel.pipeline_options import PdfPipelineOptions
+        from docling.document_converter import PdfFormatOption
+        pipeline_options = PdfPipelineOptions(
+            do_ocr=False,
+            do_table_structure=True,
+            generate_page_images=False,      # don't keep rendered page bitmaps in memory
+            generate_picture_images=False,   # don't keep figure bitmaps in memory
+        )
+        _converter = DocumentConverter(
+            format_options={"pdf": PdfFormatOption(pipeline_options=pipeline_options)}
+        )
+    return _converter
+
+def _extract_table_header(text):
+    """Return the header+separator lines of the last table in *text*, or None.
+
+    A markdown table header is:
+        | col1 | col2 |      ← header row
+        |------|------|      ← separator row  (only -, :, spaces, |)
+
+    We walk backwards through the non-empty lines to find the separator, then
+    take the line immediately above it as the header row.
+    """
+    import re
+    sep_re = re.compile(r'^\s*\|(?:[-:\s]+\|)+\s*$')
+    lines = [l for l in text.rstrip().split('\n')]  # keep empties for index math
+
+    # Find the last separator line
+    sep_idx = None
+    for i in range(len(lines) - 1, -1, -1):
+        if sep_re.match(lines[i]):
+            sep_idx = i
+            break
+
+    if sep_idx is None or sep_idx == 0:
+        return None
+
+    header_line = lines[sep_idx - 1]
+    if not header_line.lstrip().startswith('|'):
+        return None
+
+    return header_line + '\n' + lines[sep_idx]
+
+
+def _stitch_parts(parts):
+    """Join batch-converted markdown, stitching tables and headings that were
+    split at page-batch boundaries so that chunk_text() sees coherent blocks.
+
+    When a table continues across a batch boundary the new batch has only data
+    rows — the header and separator are missing.  We re-inject them so that
+    every table section is self-contained and parseable.
+    """
+    import re
+    if not parts:
+        return ""
+
+    table_row = re.compile(r'^\s*\|')
+    sep_re    = re.compile(r'^\s*\|(?:[-:\s]+\|)+\s*$')
+    result = parts[0]
+
+    for nxt in parts[1:]:
+        tail = [l for l in result.rstrip().split('\n') if l.strip()]
+        head = [l for l in nxt.lstrip().split('\n') if l.strip()]
+        last  = tail[-1] if tail else ''
+        first = head[0]  if head else ''
+
+        # Table continues across the boundary
+        if table_row.match(last) and table_row.match(first):
+            # Does nxt already have its own header+separator?
+            # A proper table starts with a non-separator row followed by a separator.
+            second_is_sep = len(head) >= 2 and sep_re.match(head[1])
+            first_is_sep  = sep_re.match(first)
+
+            if not first_is_sep and not second_is_sep:
+                # Continuation rows without a header — re-inject from result
+                header = _extract_table_header(result)
+                if header:
+                    nxt = header + '\n' + nxt.lstrip()
+
+            result = result.rstrip() + '\n' + nxt.lstrip()
+
+        # Orphaned heading at end of batch → attach body from next batch
+        elif last.startswith('#') and not first.startswith('#'):
+            result = result.rstrip() + '\n' + nxt.lstrip()
+        else:
+            result = result + '\n\n' + nxt
+
+    return result
+
+
+def _batch_worker(path, start, end, output_file):
+    """Subprocess worker: converts pages *start*–*end-1* of *path* to markdown
+    and writes the result to *output_file*.  Running in a dedicated subprocess
+    ensures that all ML-model memory (layout / table-structure networks) is
+    fully reclaimed by the OS when this process exits — it never leaks back
+    into the parent."""
+    import io
+    import pypdf
+    from docling.document_converter import DocumentConverter
+    from docling.datamodel.pipeline_options import PdfPipelineOptions
+    from docling.document_converter import PdfFormatOption
+    from docling.datamodel.document import DocumentStream
+
+    pipeline_options = PdfPipelineOptions(
+        do_ocr=False,
+        do_table_structure=True,
+        generate_page_images=False,
+        generate_picture_images=False,
+    )
+    converter = DocumentConverter(
+        format_options={"pdf": PdfFormatOption(pipeline_options=pipeline_options)}
+    )
+
+    with open(path, 'rb') as f:
+        reader = pypdf.PdfReader(f)
+        writer = pypdf.PdfWriter()
+        for p in range(start, end):
+            writer.add_page(reader.pages[p])
+        buf = io.BytesIO()
+        writer.write(buf)
+
+    buf.seek(0)
+    result = converter.convert(DocumentStream(name="batch.pdf", stream=buf))
+    markdown = result.document.export_to_markdown()
+
+    with open(output_file, 'w', encoding='utf-8') as out:
+        out.write(markdown)
+
+
+def load_pdf(path):
+    """Convert PDF to markdown via docling, BATCH_SIZE pages at a time.
+
+    Each batch runs in a *subprocess* (spawn context).  When the subprocess
+    exits the OS reclaims all of its memory — including the several GB of
+    ML-model weights that docling loads for layout/table detection.  This is
+    the only reliable way to prevent RAM+swap exhaustion on large PDFs: Python
+    GC and manual del/gc.collect() do not return heap memory to the OS.
+    """
+    import gc
+    import pypdf
+    import tempfile
+    import multiprocessing
+
+    BATCH_SIZE = 5
+
+    with open(path, 'rb') as f:
+        total_pages = len(pypdf.PdfReader(f).pages)
+
+    ranges = [(s, min(s + BATCH_SIZE, total_pages))
+              for s in range(0, total_pages, BATCH_SIZE)]
+
+    stitched = ""
+
+    for (s, e) in tqdm(ranges, desc="  Converting PDF", unit="batch",
+                       bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} batches  pp{postfix}  [{elapsed}<{remaining}]",
+                       leave=True):
+        tqdm.write(f"    pages {s + 1}–{e} of {total_pages}")
+
+        # Write markdown to a temp file — avoids serialising large strings over IPC
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".md")
+        os.close(tmp_fd)
+
+        try:
+            # 'spawn' starts a clean interpreter with no inherited model state
+            ctx = multiprocessing.get_context('spawn')
+            proc = ctx.Process(target=_batch_worker, args=(path, s, e, tmp_path))
+            proc.start()
+            proc.join()
+
+            if proc.exitcode != 0:
+                raise RuntimeError(
+                    f"Batch conversion failed (exit code {proc.exitcode}) "
+                    f"for pages {s + 1}–{e}"
+                )
+
+            with open(tmp_path, 'r', encoding='utf-8') as f:
+                part = f.read()
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+        # Stitch incrementally — parent only ever holds one batch + accumulated text
+        stitched = _stitch_parts([stitched, part]) if stitched else part
+        del part
+        gc.collect()
+
+    return stitched
+
+def load_text(path):
+    with open(path, 'r', encoding='utf-8') as f:
+        return f.read()
+
+def load_document(path):
+    if path.lower().endswith('.pdf'):
+        return load_pdf(path), True   # (text, is_markdown)
+    is_md = path.lower().endswith('.md')
+    return load_text(path), is_md
+
+def chunk_text(text, markdown=False):
+    """Split text into chunks. Uses header-aware splitting for markdown output.
+    Tables are kept intact and merged into the adjacent chunk (appended to the
+    last preceding chunk, or prepended to the next chunk if none exists yet)."""
+    import re
+
+    splitter = RecursiveCharacterTextSplitter(
+        separators=["\n\n\n", "\n\n", "\n", " "],
+        chunk_size=1500,
+        chunk_overlap=300
+    )
+    if not markdown:
+        return splitter.split_text(text)
+
+    header_splitter = MarkdownHeaderTextSplitter(
+        headers_to_split_on=[("#", "h1"), ("##", "h2"), ("###", "h3")],
+        strip_headers=False
+    )
+
+    # Match a table block: 2+ consecutive lines that start with '|'
+    table_pattern = re.compile(r'((?:^|\n)(?:\|[^\n]+\n){2,}\|[^\n]+)', re.MULTILINE)
+
+    # re.split with a capturing group yields [text, table, text, table, ...]
+    parts = table_pattern.split(text)
+
+    all_chunks = []
+    pending_tables = []  # tables waiting to be prepended to the next text chunk
+
+    for i, part in enumerate(parts):
+        if i % 2 == 0:
+            # Text segment — chunk normally
+            text_chunks = []
+            for doc in header_splitter.split_text(part):
+                text_chunks.extend(splitter.split_text(doc.page_content))
+            text_chunks = [c for c in text_chunks if c.strip()]
+
+            if text_chunks:
+                # Flush pending tables onto the first text chunk
+                if pending_tables:
+                    text_chunks[0] = "\n\n".join(pending_tables) + "\n\n" + text_chunks[0]
+                    pending_tables = []
+                all_chunks.extend(text_chunks)
+            # If no text chunks came out, pending_tables keeps waiting
+        else:
+            # Table segment — attach to last existing chunk or queue for next
+            table = part.strip()
+            if not table:
+                continue
+            if all_chunks:
+                all_chunks[-1] = all_chunks[-1] + "\n\n" + table
+            else:
+                pending_tables.append(table)
+
+    # Tables at the very end with no following text
+    if pending_tables:
+        if all_chunks:
+            all_chunks[-1] = all_chunks[-1] + "\n\n" + "\n\n".join(pending_tables)
+        else:
+            all_chunks.extend(pending_tables)
+
+    return [c for c in all_chunks if c]
+
+
+# --- DB helpers ---
+
+def get_client():
+    os.makedirs(DB_FOLDER, exist_ok=True)
+    return chromadb.PersistentClient(path=DB_FOLDER)
+
+def open_collection(create=False):
+    client = get_client()
+    if create:
+        try:
+            return client.get_collection(current_db)
+        except Exception:
+            return client.create_collection(current_db)
+    return client.get_collection(current_db)
+
+def get_embedded_sources(collection):
+    results = collection.get(include=["metadatas"])
+    if not results["metadatas"]:
+        return []
+    return sorted({m["source"] for m in results["metadatas"]})
+
+def embed_file(collection, file_path, source_name):
+    print(f"  [{source_name}] loading...")
+    text, is_markdown = load_document(file_path)
+
+    print(f"  [{source_name}] chunking...")
+    chunks = chunk_text(text, markdown=is_markdown)
+    print(f"  [{source_name}] {len(chunks)} chunks — embedding...")
+
+    for i, chunk in tqdm(enumerate(chunks), total=len(chunks),
+                         desc="  Embedding", unit="chunk",
+                         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} chunks [{elapsed}<{remaining}]",
+                         leave=False):
+        emb = ollama.embed(model=EMBEDDING_MODEL, input=chunk).embeddings[0]
+        collection.add(
+            ids=[f"{source_name}__{i}"],
+            embeddings=[emb],
+            documents=[chunk],
+            metadatas=[{"source": source_name}]
+        )
+    return len(chunks)
+
+
+# --- Subcommands ---
+
+def cmd_convert(file_path):
+    """Convert a single PDF or text file to a .md file in the same directory."""
+    if not os.path.isfile(file_path):
+        print(f"File not found: {file_path}")
+        return
+    if not file_path.lower().endswith(('.pdf', '.txt')):
+        print(f"Only .pdf or .txt files can be converted.")
+        return
+
+    dst_path = os.path.splitext(file_path)[0] + ".md"
+    if os.path.exists(dst_path):
+        answer = input(f"'{dst_path}' already exists. Overwrite? [y/N] ").strip().lower()
+        if answer != "y":
+            print("Aborted.")
+            return
+
+    print(f"Converting '{os.path.basename(file_path)}'...")
+    try:
+        text, _ = load_document(file_path)
+        with open(dst_path, 'w', encoding='utf-8') as f:
+            f.write(text)
+        print(f"✓ Saved → {dst_path}")
+        print("  Run /build to embed it into the vector database.")
+    except Exception as e:
+        print(f"✗ Conversion failed: {e}")
+
+def cmd_list():
+    try:
+        collection = open_collection()
+    except Exception:
+        print("No vector database found. Run 'build' first.")
+        return
+    sources = get_embedded_sources(collection)
+    if not sources:
+        print("No documents in the database.")
+    else:
+        print(f"Documents in the database ({len(sources)}):")
+        for s in sources:
+            # Count chunks per source
+            res = collection.get(where={"source": s}, include=["metadatas"])
+            print(f"  - {s}  ({len(res['ids'])} chunks)")
+
+def cmd_add(file_path):
+    if not os.path.isfile(file_path):
+        print(f"File not found: {file_path}")
+        return
+    if not file_path.lower().endswith('.md'):
+        print(f"Only markdown (.md) files can be embedded. Run /convert first.")
+        return
+    source_name = os.path.basename(file_path)
+    collection = open_collection(create=True)
+    if source_name in get_embedded_sources(collection):
+        print(f"'{source_name}' is already in the database. Remove it first to re-embed.")
+        return
+    print(f"Embedding '{source_name}'...")
+    count = embed_file(collection, file_path, source_name)
+    print(f"✓ Added {count} chunks from '{source_name}'.")
+
+def cmd_remove(source_name):
+    try:
+        collection = open_collection()
+    except Exception:
+        print("No vector database found.")
+        return
+    results = collection.get(where={"source": source_name}, include=["metadatas"])
+    if not results["ids"]:
+        print(f"No document named '{source_name}' found in the database.")
+        return
+    collection.delete(ids=results["ids"])
+    print(f"✓ Removed '{source_name}' ({len(results['ids'])} chunks deleted).")
+
+def cmd_build():
+    folder = docs_folder()
+    if not os.path.exists(folder):
+        os.makedirs(folder)
+        print(f"Created '{folder}/' — add files and run /convert, then /build.")
+        return
+    files = [f for f in os.listdir(folder) if f.endswith('.md')]
+    if not files:
+        print(f"No markdown files found in '{folder}/'. Run /convert first.")
+        return
+    collection = open_collection(create=True)
+    embedded = get_embedded_sources(collection)
+    new_files = [f for f in files if f not in embedded]
+    if not new_files:
+        print(f"✓ Database up to date! {collection.count()} embeddings, {len(embedded)} documents.")
+        return
+    print(f"Found {len(new_files)} new file(s) to embed:")
+    for f in new_files:
+        print(f"  - {f}")
+    answer = input("\nAdd these documents to the database? [y/N] ").strip().lower()
+    if answer != "y":
+        print("Aborted.")
+        return
+    for file in tqdm(new_files, desc="Files", unit="file"):
+        file_path = os.path.join(folder, file)
+        try:
+            count = embed_file(collection, file_path, file)
+            tqdm.write(f"  ✓ {file}: {count} chunks")
+        except Exception as e:
+            tqdm.write(f"  ✗ {file}: {e}")
+    print(f"\n✓ Done! {collection.count()} total embeddings, {len(files)} documents.")
+
+
+def cmd_chunk(file_path):
+    if not os.path.isfile(file_path):
+        print(f"File not found: {file_path}")
+        return
+    print(f"Loading '{os.path.basename(file_path)}'...")
+    text, is_markdown = load_document(file_path)
+    chunks = chunk_text(text, markdown=is_markdown)
+    print(f"\n{'='*50}")
+    print(f"Chunks: {len(chunks)}  |  Splitter: {'markdown-aware' if is_markdown else 'plain text'}")
+    print(f"{'='*50}\n")
+    for i, chunk in enumerate(chunks, 1):
+        print(f"--- Chunk {i}/{len(chunks)} ({len(chunk)} chars) ---")
+        print(chunk)
+        print()
+        if i < len(chunks):
+            answer = input("[Enter] next  [q] quit  [a] all > ").strip().lower()
+            if answer == "q":
+                break
+            elif answer == "a":
+                for j, remaining in enumerate(chunks[i:], i + 1):
+                    print(f"--- Chunk {j}/{len(chunks)} ({len(remaining)} chars) ---")
+                    print(remaining)
+                    print()
+                break
+    print(f"✓ {len(chunks)} chunks total from '{os.path.basename(file_path)}'.")
+
+
+def cmd_db():
+    global current_db
+    client = get_client()
+    collections = client.list_collections()
+    names = sorted(c.name for c in collections)
+
+    print(f"\nAvailable databases (active: '{current_db}'):")
+    if names:
+        for i, name in enumerate(names, 1):
+            marker = " *" if name == current_db else ""
+            print(f"  {i}. {name}{marker}")
+    else:
+        print("  (none yet)")
+    print(f"  n. Create new database")
+
+    choice = input("\nSelect number or type name to create: ").strip()
+    if not choice:
+        return
+    if choice.lower() == "n":
+        new_name = input("New database name: ").strip()
+        if new_name:
+            current_db = new_name
+            print(f"✓ Switched to '{current_db}'. Place documents in '{current_db}/' and run /build.")
+    else:
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(names):
+                current_db = names[idx]
+                print(f"✓ Switched to '{current_db}'. Documents folder: '{current_db}/'")
+            else:
+                print("Invalid number.")
+        except ValueError:
+            current_db = choice
+            print(f"✓ Switched to '{current_db}'. Place documents in '{current_db}/' and run /build.")
+
+
+def run_repl():
+    # Setup readline history (up arrow to access previous commands)
+    history_file = Path.home() / ".rag_history"
+    if history_file.exists():
+        readline.read_history_file(history_file)
+    readline.set_history_length(10)
+    atexit.register(readline.write_history_file, history_file)
+    
+    print("=" * 50)
+    print("RAG Database Manager")
+    print("=" * 50)
+    print("Commands: /db              — list / switch / create a database")
+    print("          /list            — list indexed documents")
+    print("          /convert <path>  — convert PDF/txt files to .md (supports *.pdf patterns)")
+    print("          /build           — embed .md files from <db>/")
+    print("          /add <file>      — embed a specific .md file")
+    print("          /remove <name>   — remove a document by name")
+    print("          /chunk <file>    — preview how a file will be chunked")
+    print("          /quit            — exit\n")
+
+    while True:
+        try:
+            raw = input(f"[{current_db}]> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nGoodbye!")
+            break
+
+        if not raw:
+            continue
+
+        if raw == "/quit":
+            print("Goodbye!")
+            break
+        elif raw == "/db":
+            cmd_db()
+        elif raw == "/list":
+            cmd_list()
+        elif raw.startswith("/convert "):
+            pattern = raw[9:].strip()
+            # Expand glob patterns
+            files = sorted(glob.glob(pattern))
+            if not files:
+                print(f"No files match: {pattern}")
+            else:
+                print(f"\nFound {len(files)} file(s) to convert:")
+                for i, f in enumerate(files, 1):
+                    print(f"  {i}. {f}")
+                confirm = input(f"\nProceed with conversion? [y/N] ").strip().lower()
+                if confirm == "y":
+                    for file_path in files:
+                        cmd_convert(file_path)
+                else:
+                    print("Aborted.")
+        elif raw == "/convert":
+            print("Usage: /convert <path>  (e.g., /convert docs/*.pdf or /convert docs/file.pdf)")
+        elif raw == "/build":
+            cmd_build()
+        elif raw.startswith("/add "):
+            file_path = raw[5:].strip()
+            cmd_add(file_path)
+        elif raw == "/add":
+            print("Usage: /add <path>")
+        elif raw.startswith("/remove "):
+            name = raw[8:].strip()
+            cmd_remove(name)
+        elif raw == "/remove":
+            print("Usage: /remove <name>")
+        elif raw.startswith("/chunk "):
+            file_path = raw[7:].strip()
+            cmd_chunk(file_path)
+        elif raw == "/chunk":
+            print("Usage: /chunk <path>")
+        else:
+            print(f"Unknown command: '{raw}'. Type /quit to exit.")
+
+
+if __name__ == "__main__":
+    run_repl()
