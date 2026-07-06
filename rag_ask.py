@@ -4,8 +4,24 @@ warnings.filterwarnings("ignore", message=".*unauthenticated.*")
 import ollama
 import chromadb
 import os
+import logging
+from datetime import datetime
 from sentence_transformers import CrossEncoder
 from rank_bm25 import BM25Okapi
+
+# Setup logging
+logging.basicConfig(
+    filename="ask.log",
+    level=logging.INFO,
+    format="%(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+
+# Suppress verbose logging from external libraries
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
+logging.getLogger("transformers").setLevel(logging.WARNING)
+logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 
 reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
@@ -65,7 +81,11 @@ def select_model(model_type):
             print("Invalid input. Please enter a number.")
 
 # Retrieve and rerank relevant chunks using hybrid search (vector + BM25)
-def search(collection, question, top_n=5):
+def search(collection, question, top_n=10):
+    # Get all documents with metadata for lookup
+    all_results = collection.get(include=["documents", "metadatas"])
+    doc_to_metadata = {doc: meta for doc, meta in zip(all_results["documents"], all_results["metadatas"])}
+    
     # --- Vector retrieval ---
     q_emb = ollama.embed(
         model="nomic-embed-text",
@@ -74,7 +94,7 @@ def search(collection, question, top_n=5):
 
     vec_results = collection.query(
         query_embeddings=[q_emb],
-        n_results=20
+        n_results=30
     )
     vec_ranked = vec_results["documents"][0]
 
@@ -94,12 +114,38 @@ def search(collection, question, top_n=5):
     pairs = [[question, doc] for doc in candidates]
     scores = reranker.predict(pairs)
     ranked = sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)
-    return [doc for _, doc in ranked[:top_n]]
+    
+    # Return documents with metadata
+    results = []
+    for _, doc in ranked[:top_n]:
+        metadata = doc_to_metadata.get(doc, {})
+        results.append((doc, metadata))
+    return results
 
 # Query RAG
 def ask(collection, question, chat_model):
-    top_docs = search(collection, question)
-    context = "\n\n".join(top_docs)
+    top_docs_with_meta = search(collection, question)
+    
+    # Format context with source attribution and heading information
+    context_parts = []
+    for doc, metadata in top_docs_with_meta:
+        source = metadata.get("source", "Unknown source")
+        heading_path = metadata.get("heading_path", [])
+        
+        # Build context header with source and hierarchical headings
+        if heading_path:
+            heading_str = " > ".join(heading_path)
+            header = f"[Source: {source} | Section: {heading_str}]"
+        else:
+            header = f"[Source: {source}]"
+        
+        context_parts.append(f"{header}\n{doc}")
+    context = "\n\n".join(context_parts)
+
+    # Log the question with context
+    timestamp_q = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_q = f"\n{'='*80}\nTimestamp: {timestamp_q}\nModel: {chat_model}\n{'='*80}\n\nQUESTION:\n{question}\n\n{'-'*80}\nCONTEXT:\n{'-'*80}\n{context}\n"
+    logging.info(log_q)
 
     response = ollama.chat(
         model=chat_model,
@@ -116,7 +162,14 @@ def ask(collection, question, chat_model):
         think=False
     )
 
-    return response["message"]["content"]
+    answer = response["message"]["content"]
+    
+    # Log the answer with separate timestamp
+    timestamp_a = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_a = f"\n{'-'*80}\nANSWER (received at {timestamp_a}):\n{'-'*80}\n{answer}\n"
+    logging.info(log_a)
+
+    return answer
 
 # Load and query
 if __name__ == "__main__":
@@ -200,10 +253,18 @@ if __name__ == "__main__":
             break
         elif raw.startswith("/search "):
             query = raw[len("/search "):].strip()
-            docs = search(collection, query)
+            docs_with_meta = search(collection, query)
             print("\n" + "=" * 50 + " SEARCH RESULTS " + "=" * 50)
-            for i, doc in enumerate(docs, 1):
-                print(f"\n--- Result {i} ---")
+            for i, (doc, metadata) in enumerate(docs_with_meta, 1):
+                source = metadata.get("source", "Unknown source")
+                heading_path = metadata.get("heading_path", [])
+                
+                # Display with hierarchical headings
+                if heading_path:
+                    heading_str = " > ".join(heading_path)
+                    print(f"\n--- Result {i} (Source: {source} | Section: {heading_str}) ---")
+                else:
+                    print(f"\n--- Result {i} (Source: {source}) ---")
                 print(doc)
             print("=" * 117 + "\n")
         elif raw.startswith("/ask "):

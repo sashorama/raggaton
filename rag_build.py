@@ -41,37 +41,6 @@ def _get_converter():
         )
     return _converter
 
-def _extract_table_header(text):
-    """Return the header+separator lines of the last table in *text*, or None.
-
-    A markdown table header is:
-        | col1 | col2 |      ← header row
-        |------|------|      ← separator row  (only -, :, spaces, |)
-
-    We walk backwards through the non-empty lines to find the separator, then
-    take the line immediately above it as the header row.
-    """
-    import re
-    sep_re = re.compile(r'^\s*\|(?:[-:\s]+\|)+\s*$')
-    lines = [l for l in text.rstrip().split('\n')]  # keep empties for index math
-
-    # Find the last separator line
-    sep_idx = None
-    for i in range(len(lines) - 1, -1, -1):
-        if sep_re.match(lines[i]):
-            sep_idx = i
-            break
-
-    if sep_idx is None or sep_idx == 0:
-        return None
-
-    header_line = lines[sep_idx - 1]
-    if not header_line.lstrip().startswith('|'):
-        return None
-
-    return header_line + '\n' + lines[sep_idx]
-
-
 def _stitch_parts(parts):
     """Join batch-converted markdown, stitching tables and headings that were
     split at page-batch boundaries so that chunk_text() sees coherent blocks.
@@ -157,6 +126,43 @@ def _batch_worker(path, start, end, output_file):
         out.write(markdown)
 
 
+def _build_enriched_chunk(chunk_content, metadata):
+    """Build an enriched chunk by prepending metadata to the content.
+    Format:
+    Document: <source>
+    
+    Hierarchy:
+    <h1>
+    <h2>
+    <h3>
+    
+    <chunk_content>
+    """
+    lines = []
+    
+    if metadata.get("source"):
+        lines.append(f"Document: {metadata['source']}")
+        lines.append("")
+    
+    # Build hierarchy section
+    hierarchy = []
+    if metadata.get("h1"):
+        hierarchy.append(metadata["h1"])
+    if metadata.get("h2"):
+        hierarchy.append(metadata["h2"])
+    if metadata.get("h3"):
+        hierarchy.append(metadata["h3"])
+    
+    if hierarchy:
+        lines.append("Hierarchy:")
+        for item in hierarchy:
+            lines.append(item)
+        lines.append("")
+    
+    lines.append(chunk_content)
+    return "\n".join(lines)
+
+
 def load_pdf(path):
     """Convert PDF to markdown via docling, BATCH_SIZE pages at a time.
 
@@ -228,10 +234,13 @@ def load_document(path):
     is_md = path.lower().endswith('.md')
     return load_text(path), is_md
 
-def chunk_text(text, markdown=False):
+def chunk_text(text, markdown=False, debug=False, source_name=None):
     """Split text into chunks. Uses header-aware splitting for markdown output.
     Tables are kept intact and merged into the adjacent chunk (appended to the
-    last preceding chunk, or prepended to the next chunk if none exists yet)."""
+    last preceding chunk, or prepended to the next chunk if none exists yet).
+    Tracks heading hierarchy: when a higher-level heading appears, updates all
+    parent levels. Chunks inherit the full heading path including all ancestors.
+    Returns list of (chunk_text, metadata_dict) tuples for markdown, plain strings for plain text."""
     import re
 
     splitter = RecursiveCharacterTextSplitter(
@@ -240,6 +249,7 @@ def chunk_text(text, markdown=False):
         chunk_overlap=300
     )
     if not markdown:
+        # Plain text: return strings (will be wrapped in embed_file)
         return splitter.split_text(text)
 
     header_splitter = MarkdownHeaderTextSplitter(
@@ -247,48 +257,99 @@ def chunk_text(text, markdown=False):
         strip_headers=False
     )
 
+    # FIRST: Apply header splitting to the entire document to preserve heading hierarchy
+    header_docs = header_splitter.split_text(text)
+    
     # Match a table block: 2+ consecutive lines that start with '|'
     table_pattern = re.compile(r'((?:^|\n)(?:\|[^\n]+\n){2,}\|[^\n]+)', re.MULTILINE)
 
-    # re.split with a capturing group yields [text, table, text, table, ...]
-    parts = table_pattern.split(text)
-
     all_chunks = []
-    pending_tables = []  # tables waiting to be prepended to the next text chunk
+    
+    # Track active headings as we process documents in order
+    active_headings = {"h1": None, "h2": None, "h3": None}
 
-    for i, part in enumerate(parts):
-        if i % 2 == 0:
-            # Text segment — chunk normally
-            text_chunks = []
-            for doc in header_splitter.split_text(part):
-                text_chunks.extend(splitter.split_text(doc.page_content))
-            text_chunks = [c for c in text_chunks if c.strip()]
-
-            if text_chunks:
-                # Flush pending tables onto the first text chunk
-                if pending_tables:
-                    text_chunks[0] = "\n\n".join(pending_tables) + "\n\n" + text_chunks[0]
+    for doc_idx, doc in enumerate(header_docs):
+        # Update active headings based on this document's metadata
+        # Each document tells us what heading section it's in
+        if "h1" in doc.metadata:
+            new_h1 = doc.metadata["h1"]
+            if new_h1 != active_headings["h1"]:
+                active_headings["h1"] = new_h1
+                active_headings["h2"] = None
+                active_headings["h3"] = None
+        
+        if "h2" in doc.metadata:
+            new_h2 = doc.metadata["h2"]
+            if new_h2 != active_headings["h2"]:
+                active_headings["h2"] = new_h2
+                active_headings["h3"] = None
+        
+        if "h3" in doc.metadata:
+            new_h3 = doc.metadata["h3"]
+            if new_h3 != active_headings["h3"]:
+                active_headings["h3"] = new_h3
+        
+        if debug:
+            # Only show when there's new heading metadata
+            has_heading = any(doc.metadata.get(k) for k in ["h1", "h2", "h3"])
+            if has_heading:
+                print(f"  Doc {doc_idx}: metadata={doc.metadata}, active_headings now={active_headings}")
+        
+        # Build heading metadata dict with level info and document name
+        heading_metadata = {
+            "h1": active_headings["h1"],
+            "h2": active_headings["h2"],
+            "h3": active_headings["h3"]
+        }
+        
+        # Add document information if provided
+        if source_name:
+            heading_metadata["source"] = source_name
+            heading_metadata["document"] = os.path.splitext(source_name)[0]
+        
+        # NOW: Split the document content by tables
+        # re.split with a capturing group yields [text, table, text, table, ...]
+        parts = table_pattern.split(doc.page_content)
+        
+        pending_tables = []  # tables waiting to be prepended to next chunk
+        text_chunks = []
+        
+        for i, part in enumerate(parts):
+            if i % 2 == 0:
+                # Text segment — chunk further with RecursiveCharacterTextSplitter
+                for chunk_content in splitter.split_text(part):
+                    if chunk_content.strip():
+                        text_chunks.append((chunk_content, heading_metadata.copy()))
+                
+                # Flush pending tables onto first text chunk
+                if text_chunks and pending_tables:
+                    content, hmeta = text_chunks[0]
+                    text_chunks[0] = ("\n\n".join(pending_tables) + "\n\n" + content, hmeta)
                     pending_tables = []
-                all_chunks.extend(text_chunks)
-            # If no text chunks came out, pending_tables keeps waiting
-        else:
-            # Table segment — attach to last existing chunk or queue for next
-            table = part.strip()
-            if not table:
-                continue
-            if all_chunks:
-                all_chunks[-1] = all_chunks[-1] + "\n\n" + table
             else:
-                pending_tables.append(table)
+                # Table segment — attach to last chunk or queue for next
+                table = part.strip()
+                if not table:
+                    continue
+                if text_chunks:
+                    content, hmeta = text_chunks[-1]
+                    text_chunks[-1] = (content + "\n\n" + table, hmeta)
+                else:
+                    pending_tables.append(table)
+        
+        # Tables at end of this header section
+        if pending_tables:
+            if text_chunks:
+                content, hmeta = text_chunks[-1]
+                text_chunks[-1] = (content + "\n\n" + "\n\n".join(pending_tables), hmeta)
+            else:
+                # Table with no text under this heading — carry forward to next header section
+                for table in pending_tables:
+                    all_chunks.append((table, heading_metadata.copy()))
+        
+        all_chunks.extend(text_chunks)
 
-    # Tables at the very end with no following text
-    if pending_tables:
-        if all_chunks:
-            all_chunks[-1] = all_chunks[-1] + "\n\n" + "\n\n".join(pending_tables)
-        else:
-            all_chunks.extend(pending_tables)
-
-    return [c for c in all_chunks if c]
+    return [(c, m) for c, m in all_chunks if c]
 
 
 # --- DB helpers ---
@@ -317,19 +378,38 @@ def embed_file(collection, file_path, source_name):
     text, is_markdown = load_document(file_path)
 
     print(f"  [{source_name}] chunking...")
-    chunks = chunk_text(text, markdown=is_markdown)
+    chunks = chunk_text(text, markdown=is_markdown, source_name=source_name)
     print(f"  [{source_name}] {len(chunks)} chunks — embedding...")
 
-    for i, chunk in tqdm(enumerate(chunks), total=len(chunks),
-                         desc="  Embedding", unit="chunk",
-                         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} chunks [{elapsed}<{remaining}]",
-                         leave=False):
-        emb = ollama.embed(model=EMBEDDING_MODEL, input=chunk).embeddings[0]
+    for i, chunk_data in tqdm(enumerate(chunks), total=len(chunks),
+                              desc="  Embedding", unit="chunk",
+                              bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} chunks [{elapsed}<{remaining}]",
+                              leave=False):
+        # Handle both markdown (tuple) and plain text (string) formats
+        if is_markdown and isinstance(chunk_data, tuple):
+            chunk_text_content, chunk_metadata = chunk_data
+            # chunk_metadata already includes source, document, h1, h2, h3 from chunk_text
+            metadata = chunk_metadata.copy()
+        else:
+            chunk_text_content = chunk_data
+            # Plain text - add minimal metadata
+            metadata = {
+                "source": source_name,
+                "document": os.path.splitext(source_name)[0],
+            }
+        
+        # Build enriched chunk content with metadata prefix
+        enriched_content = _build_enriched_chunk(chunk_text_content, metadata)
+        
+        # Filter out None values for ChromaDB (it doesn't accept None in metadatas)
+        clean_metadata = {k: v for k, v in metadata.items() if v is not None}
+        
+        emb = ollama.embed(model=EMBEDDING_MODEL, input=enriched_content).embeddings[0]
         collection.add(
             ids=[f"{source_name}__{i}"],
             embeddings=[emb],
-            documents=[chunk],
-            metadatas=[{"source": source_name}]
+            documents=[enriched_content],  # Store enriched content so search results include metadata
+            metadatas=[clean_metadata]
         )
     return len(chunks)
 
@@ -378,21 +458,49 @@ def cmd_list():
             res = collection.get(where={"source": s}, include=["metadatas"])
             print(f"  - {s}  ({len(res['ids'])} chunks)")
 
-def cmd_add(file_path):
+def cmd_add(file_name, debug=False):
+    folder = docs_folder()
+    file_path = os.path.join(folder, file_name)
+    
     if not os.path.isfile(file_path):
         print(f"File not found: {file_path}")
         return
-    if not file_path.lower().endswith('.md'):
-        print(f"Only markdown (.md) files can be embedded. Run /convert first.")
+    if not file_name.lower().endswith('.md'):
+        print(f"Only markdown (.md) files can be embedded.")
         return
-    source_name = os.path.basename(file_path)
+    
     collection = open_collection(create=True)
-    if source_name in get_embedded_sources(collection):
-        print(f"'{source_name}' is already in the database. Remove it first to re-embed.")
+    if file_name in get_embedded_sources(collection):
+        print(f"'{file_name}' is already in the database. Remove it first to re-embed.")
         return
-    print(f"Embedding '{source_name}'...")
-    count = embed_file(collection, file_path, source_name)
-    print(f"✓ Added {count} chunks from '{source_name}'.")
+    print(f"Embedding '{file_name}'...")
+    
+    if debug:
+        # Show what will be embedded
+        print(f"\n{'='*60}")
+        print(f"DEBUG: Showing enriched chunks that will be embedded")
+        print(f"{'='*60}\n")
+        
+        text, is_markdown = load_document(file_path)
+        chunks = chunk_text(text, markdown=is_markdown, source_name=file_name)
+        
+        for i, chunk_data in enumerate(chunks[:3], 1):  # Show first 3
+            if is_markdown and isinstance(chunk_data, tuple):
+                chunk_content, chunk_metadata = chunk_data
+                enriched = _build_enriched_chunk(chunk_content, chunk_metadata)
+                clean_metadata = {k: v for k, v in chunk_metadata.items() if v is not None}
+                
+                print(f"--- Chunk {i}/{len(chunks)} (will be embedded) ---")
+                print(enriched)
+                print(f"\nMetadata stored in ChromaDB: {clean_metadata}")
+                print()
+        
+        if len(chunks) > 3:
+            print(f"... ({len(chunks) - 3} more chunks)")
+        print(f"{'='*60}\n")
+    
+    count = embed_file(collection, file_path, file_name)
+    print(f"✓ Added {count} chunks from '{file_name}'.")
 
 def cmd_remove(source_name):
     try:
@@ -446,25 +554,90 @@ def cmd_chunk(file_path):
         return
     print(f"Loading '{os.path.basename(file_path)}'...")
     text, is_markdown = load_document(file_path)
-    chunks = chunk_text(text, markdown=is_markdown)
+    source_name = os.path.basename(file_path)
+    chunks = chunk_text(text, markdown=is_markdown, debug=False, source_name=source_name)
     print(f"\n{'='*50}")
     print(f"Chunks: {len(chunks)}  |  Splitter: {'markdown-aware' if is_markdown else 'plain text'}")
     print(f"{'='*50}\n")
-    for i, chunk in enumerate(chunks, 1):
-        print(f"--- Chunk {i}/{len(chunks)} ({len(chunk)} chars) ---")
-        print(chunk)
+    for i, chunk_data in enumerate(chunks, 1):
+        # Handle both markdown (tuple) and plain text (string) formats
+        if is_markdown and isinstance(chunk_data, tuple):
+            chunk_content, chunk_metadata = chunk_data
+            
+            # Build enriched chunk as it will be embedded
+            enriched_chunk = _build_enriched_chunk(chunk_content, chunk_metadata)
+            
+            # Build heading display string
+            heading_parts = []
+            if chunk_metadata.get("h1"):
+                heading_parts.append(chunk_metadata["h1"])
+            if chunk_metadata.get("h2"):
+                heading_parts.append(chunk_metadata["h2"])
+            if chunk_metadata.get("h3"):
+                heading_parts.append(chunk_metadata["h3"])
+            heading_str = " → ".join(heading_parts) if heading_parts else "(no heading)"
+            
+            print(f"--- Chunk {i}/{len(chunks)} | Headings: {heading_str} ---")
+            print(f"    [This is what will be embedded] ({len(enriched_chunk)} chars)")
+            print(enriched_chunk)
+        else:
+            print(f"--- Chunk {i}/{len(chunks)} ({len(chunk_data)} chars) ---")
+            print(chunk_data)
         print()
         if i < len(chunks):
             answer = input("[Enter] next  [q] quit  [a] all > ").strip().lower()
             if answer == "q":
                 break
             elif answer == "a":
-                for j, remaining in enumerate(chunks[i:], i + 1):
-                    print(f"--- Chunk {j}/{len(chunks)} ({len(remaining)} chars) ---")
-                    print(remaining)
+                for j, remaining_data in enumerate(chunks[i:], i + 1):
+                    if is_markdown and isinstance(remaining_data, tuple):
+                        remaining_content, remaining_metadata = remaining_data
+                        
+                        # Build enriched chunk as it will be embedded
+                        enriched_chunk = _build_enriched_chunk(remaining_content, remaining_metadata)
+                        
+                        # Build heading display string
+                        heading_parts = []
+                        if remaining_metadata.get("h1"):
+                            heading_parts.append(remaining_metadata["h1"])
+                        if remaining_metadata.get("h2"):
+                            heading_parts.append(remaining_metadata["h2"])
+                        if remaining_metadata.get("h3"):
+                            heading_parts.append(remaining_metadata["h3"])
+                        heading_str = " → ".join(heading_parts) if heading_parts else "(no heading)"
+                        
+                        print(f"--- Chunk {j}/{len(chunks)} | Headings: {heading_str} ---")
+                        print(f"    [This is what will be embedded] ({len(enriched_chunk)} chars)")
+                        print(enriched_chunk)
+                    else:
+                        print(f"--- Chunk {j}/{len(chunks)} ({len(remaining_data)} chars) ---")
+                        print(remaining_data)
                     print()
                 break
     print(f"✓ {len(chunks)} chunks total from '{os.path.basename(file_path)}'.")
+
+
+def cmd_delete():
+    global current_db
+    client = get_client()
+    try:
+        collection = open_collection()
+        count = collection.count()
+    except Exception:
+        print(f"Database '{current_db}' does not exist.")
+        return
+
+    answer = input(
+        f"Delete database '{current_db}' ({count} embeddings)? This cannot be undone. [y/N] "
+    ).strip().lower()
+    if answer != "y":
+        print("Aborted.")
+        return
+
+    client.delete_collection(current_db)
+    print(f"✓ Deleted database '{current_db}'.")
+    current_db = "docs"
+    print(f"Switched back to default database 'docs'.")
 
 
 def cmd_db():
@@ -481,11 +654,15 @@ def cmd_db():
     else:
         print("  (none yet)")
     print(f"  n. Create new database")
+    print(f"  d. Delete current database")
 
     choice = input("\nSelect number or type name to create: ").strip()
     if not choice:
         return
-    if choice.lower() == "n":
+    if choice.lower() == "d":
+        cmd_delete()
+        return
+    elif choice.lower() == "n":
         new_name = input("New database name: ").strip()
         if new_name:
             current_db = new_name
@@ -515,10 +692,12 @@ def run_repl():
     print("RAG Database Manager")
     print("=" * 50)
     print("Commands: /db              — list / switch / create a database")
+    print("          /db delete       — delete the current database")
     print("          /list            — list indexed documents")
     print("          /convert <path>  — convert PDF/txt files to .md (supports *.pdf patterns)")
     print("          /build           — embed .md files from <db>/")
     print("          /add <file>      — embed a specific .md file")
+    print("          /add <file> debug — embed and show what will be stored")
     print("          /remove <name>   — remove a document by name")
     print("          /chunk <file>    — preview how a file will be chunked")
     print("          /quit            — exit\n")
@@ -536,8 +715,11 @@ def run_repl():
         if raw == "/quit":
             print("Goodbye!")
             break
-        elif raw == "/db":
-            cmd_db()
+        elif raw in ("/db", "/db delete"):
+            if raw == "/db delete":
+                cmd_delete()
+            else:
+                cmd_db()
         elif raw == "/list":
             cmd_list()
         elif raw.startswith("/convert "):
@@ -561,10 +743,21 @@ def run_repl():
         elif raw == "/build":
             cmd_build()
         elif raw.startswith("/add "):
-            file_path = raw[5:].strip()
-            cmd_add(file_path)
+            args = raw[5:].strip()
+            # Check if debug flag is at the end
+            debug = args.endswith(" debug")
+            if debug:
+                file_path = args[:-6].strip()  # Remove " debug" suffix
+            else:
+                file_path = args
+            
+            if not file_path:
+                print("Usage: /add <file> [debug]")
+                return
+            
+            cmd_add(file_path, debug=debug)
         elif raw == "/add":
-            print("Usage: /add <path>")
+            print("Usage: /add <file> [debug]")
         elif raw.startswith("/remove "):
             name = raw[8:].strip()
             cmd_remove(name)
