@@ -126,7 +126,7 @@ def _batch_worker(path, start, end, output_file):
         out.write(markdown)
 
 
-def _build_enriched_chunk(chunk_content, metadata):
+def _build_enriched_chunk(chunk):
     """Build an enriched chunk by prepending metadata to the content.
     Format:
     Document: <source>
@@ -140,18 +140,18 @@ def _build_enriched_chunk(chunk_content, metadata):
     """
     lines = []
     
-    if metadata.get("source"):
-        lines.append(f"Document: {metadata['source']}")
+    if chunk.metadata.get("source"):
+        lines.append(f"Document: {chunk.metadata['source']}")
         lines.append("")
     
     # Build hierarchy section
     hierarchy = []
-    if metadata.get("h1"):
-        hierarchy.append(metadata["h1"])
-    if metadata.get("h2"):
-        hierarchy.append(metadata["h2"])
-    if metadata.get("h3"):
-        hierarchy.append(metadata["h3"])
+    if chunk.metadata.get("h1"):
+        hierarchy.append(chunk.metadata.get("h1"))
+    if chunk.metadata.get("h2"):
+        hierarchy.append(chunk.metadata.get("h2"))
+    if chunk.metadata.get("h3"):
+        hierarchy.append(chunk.metadata.get("h3"))
     
     if hierarchy:
         lines.append("Hierarchy:")
@@ -159,7 +159,7 @@ def _build_enriched_chunk(chunk_content, metadata):
             lines.append(item)
         lines.append("")
     lines.append("Content:")
-    lines.append(chunk_content)
+    lines.append(chunk.page_content)
     return "\n".join(lines)
 
 
@@ -388,35 +388,23 @@ def embed_file(collection, file_path, source_name):
     chunks = chunk_text(text, markdown=is_markdown, source_name=source_name)
     print(f"  [{source_name}] {len(chunks)} chunks — embedding...")
 
-    for i, chunk_data in tqdm(enumerate(chunks), total=len(chunks),
+    for i, chunk in tqdm(enumerate(chunks), total=len(chunks),
                               desc="  Embedding", unit="chunk",
                               bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} chunks [{elapsed}<{remaining}]",
                               leave=False):
-        # Handle both markdown (tuple) and plain text (string) formats
-        if is_markdown and isinstance(chunk_data, tuple):
-            chunk_text_content, chunk_metadata = chunk_data
-            # chunk_metadata already includes source, document, h1, h2, h3 from chunk_text
-            metadata = chunk_metadata.copy()
-        else:
-            chunk_text_content = chunk_data
-            # Plain text - add minimal metadata
-            metadata = {
-                "source": source_name,
-                "document": os.path.splitext(source_name)[0],
-            }
         
         # Build enriched chunk content with metadata prefix
-        enriched_content = _build_enriched_chunk(chunk_text_content, metadata)
+        enriched_content = _build_enriched_chunk(chunk)
         
         # Filter out None values for ChromaDB (it doesn't accept None in metadatas)
-        clean_metadata = {k: v for k, v in metadata.items() if v is not None}
+        #clean_metadata = {k: v for k, v in metadata.items() if v is not None}
         
         emb = ollama.embed(model=EMBEDDING_MODEL, input=enriched_content).embeddings[0]
         collection.add(
             ids=[f"{source_name}__{i}"],
             embeddings=[emb],
-            documents=[chunk_text_content],  # Store plain chunk text; enriched version used only for embedding
-            metadatas=[clean_metadata]
+            documents=[chunk.page_content],  # Store plain chunk text; enriched version used only for embedding
+            metadatas=[chunk.metadata]
         )
     return len(chunks)
 

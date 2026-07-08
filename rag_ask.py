@@ -85,48 +85,115 @@ def select_model(model_type):
 
 # Retrieve and rerank relevant chunks using hybrid search (vector + BM25)
 def search(collection, question, top_n=10):
-    # Get all documents with metadata for lookup
-    all_results = collection.get(include=["documents", "metadatas"])
-    doc_to_metadata = {doc: meta for doc, meta in zip(all_results["documents"], all_results["metadatas"])}
-    
-    # --- Vector retrieval ---
+    # ---------------------------------------------------------
+    # 1. Create query embedding
+    # ---------------------------------------------------------
     q_emb = ollama.embed(
         model="nomic-embed-text",
         input=question
     ).embeddings[0]
 
+
+    # ---------------------------------------------------------
+    # 2. Vector retrieval from ChromaDB
+    # ---------------------------------------------------------
     vec_results = collection.query(
         query_embeddings=[q_emb],
-        n_results=30
+        n_results=30,
+        include=[
+            "documents",
+            "metadatas",
+            "distances"
+        ]
     )
-    vec_ranked = vec_results["documents"][0]
 
-    # --- BM25 retrieval ---
+    vec_docs = vec_results["documents"][0]
+    vec_meta = vec_results["metadatas"][0]
+
+    # Keep metadata attached to documents
+    vector_results = {
+        doc: meta
+        for doc, meta in zip(vec_docs, vec_meta)
+    }
+
+
+    # ---------------------------------------------------------
+    # 3. BM25 retrieval
+    # ---------------------------------------------------------
     bm25, corpus = get_bm25(collection)
+
     tokens = question.lower().split()
+
     bm25_scores = bm25.get_scores(tokens)
-    bm25_ranked = [corpus[i] for i in sorted(range(len(bm25_scores)),
-                                              key=lambda i: bm25_scores[i],
-                                              reverse=True)[:20]]
 
-    # --- Reciprocal Rank Fusion ---
-    fused = reciprocal_rank_fusion([vec_ranked, bm25_ranked])
-    candidates = sorted(fused, key=fused.get, reverse=True)[:30]
+    bm25_docs = [
+        corpus[i]
+        for i in sorted(
+            range(len(bm25_scores)),
+            key=lambda i: bm25_scores[i],
+            reverse=True
+        )[:20]
+    ]
 
-    # --- Cross-encoder reranking ---
-    pairs = [[question, doc] for doc in candidates]
+
+    # ---------------------------------------------------------
+    # 4. Reciprocal Rank Fusion
+    # ---------------------------------------------------------
+    fused = reciprocal_rank_fusion(
+        [
+            vec_docs,
+            bm25_docs
+        ]
+    )
+
+    candidates = sorted(
+        fused,
+        key=fused.get,
+        reverse=True
+    )[:30]
+
+
+    # ---------------------------------------------------------
+    # 5. Cross encoder reranking
+    # ---------------------------------------------------------
+    pairs = [
+        [question, doc]
+        for doc in candidates
+    ]
+
     scores = reranker.predict(pairs)
-    ranked = sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)
-    
-    # Return documents with metadata
+
+    ranked = sorted(
+        zip(scores, candidates),
+        key=lambda x: x[0],
+        reverse=True
+    )
+
+
+    # ---------------------------------------------------------
+    # 6. Return documents + metadata
+    # ---------------------------------------------------------
     results = []
-    for _, doc in ranked[:top_n]:
-        metadata = doc_to_metadata.get(doc, {})
-        results.append((doc, metadata))
+
+    for score, doc in ranked[:top_n]:
+
+        metadata = vector_results.get(
+            doc,
+            {}
+        )
+
+        results.append(
+            {
+                "document": doc,
+                "metadata": metadata,
+                "score": float(score)
+            }
+        )
+
     return results
 
 # Query RAG
-def _build_context(top_docs_with_meta):
+def _build_context(top_chunks_with_meta):
     """Group chunks by document then section. Each document and section
     appears exactly once, in order of first appearance in search results.
     Section header shows only the parent levels:
@@ -141,7 +208,8 @@ def _build_context(top_docs_with_meta):
     # OrderedDict preserves insertion order → first-appearance order
     docs = OrderedDict()
 
-    for doc, metadata in top_docs_with_meta:
+    for doc in top_chunks_with_meta:
+        metadata = doc.get("metadata", {})
         source = metadata.get("source", "Unknown")
         h1 = metadata.get("h1", "")
         h2 = metadata.get("h2", "")
@@ -162,19 +230,17 @@ def _build_context(top_docs_with_meta):
             docs[source][section_key] = []
 
         docs[source][section_key].append(doc)
-
     context_parts = []
+    
     for source, sections in docs.items():
         doc_lines = [SEP, f"Document: {source}"]
-
         for section_key, chunks in sections.items():
             if section_key:
                 doc_lines.append(f"\nSection: {' > '.join(section_key)}")
-
-            doc_lines.extend(chunks)
-
+            doc_lines.append(chunks[0].get("document", ""))
+            
         context_parts.append("\n".join(doc_lines))
-
+    
     return "\n\n".join(context_parts)
 
 
@@ -304,17 +370,23 @@ if __name__ == "__main__":
             query = raw[len("/search "):].strip()
             docs_with_meta = search(collection, query)
             print("\n" + "=" * 50 + " SEARCH RESULTS " + "=" * 50)
-            for i, (doc, metadata) in enumerate(docs_with_meta, 1):
-                source = metadata.get("source", "Unknown source")
-                heading_path = metadata.get("heading_path", [])
-                
+
+            
+            for i, result_i in enumerate(docs_with_meta, 1):
+                metadata = result_i.get("metadata")
+                heading_path = metadata.get("h1",""), metadata.get("h2",""), metadata.get("h3","")
+                source = metadata.get("source", "Unknown")
+                #print(source)
+                #print(heading_path)
+               
                 # Display with hierarchical headings
                 if heading_path:
                     heading_str = " > ".join(heading_path)
                     print(f"\n--- Result {i} (Source: {source} | Section: {heading_str}) ---")
                 else:
                     print(f"\n--- Result {i} (Source: {source}) ---")
-                print(doc)
+                print(result_i.get("document", ""))
+            
             print("=" * 117 + "\n")
         elif raw.startswith("/context "):
             query = raw[len("/context "):].strip()
