@@ -158,7 +158,7 @@ def _build_enriched_chunk(chunk_content, metadata):
         for item in hierarchy:
             lines.append(item)
         lines.append("")
-    
+    lines.append("Content:")
     lines.append(chunk_content)
     return "\n".join(lines)
 
@@ -263,8 +263,8 @@ def chunk_text(text, markdown=False, debug=False, source_name=None):
     # Match a table block: 2+ consecutive lines that start with '|'
     table_pattern = re.compile(r'((?:^|\n)(?:\|[^\n]+\n){2,}\|[^\n]+)', re.MULTILINE)
 
-    all_chunks = []
-    
+    #all_chunks = []
+    '''
     # Track active headings as we process documents in order
     active_headings = {"h1": None, "h2": None, "h3": None}
 
@@ -296,6 +296,7 @@ def chunk_text(text, markdown=False, debug=False, source_name=None):
                 print(f"  Doc {doc_idx}: metadata={doc.metadata}, active_headings now={active_headings}")
         
         # Build heading metadata dict with level info and document name
+        
         heading_metadata = {
             "h1": active_headings["h1"],
             "h2": active_headings["h2"],
@@ -336,7 +337,7 @@ def chunk_text(text, markdown=False, debug=False, source_name=None):
                     text_chunks[-1] = (content + "\n\n" + table, hmeta)
                 else:
                     pending_tables.append(table)
-        
+
         # Tables at end of this header section
         if pending_tables:
             if text_chunks:
@@ -348,8 +349,14 @@ def chunk_text(text, markdown=False, debug=False, source_name=None):
                     all_chunks.append((table, heading_metadata.copy()))
         
         all_chunks.extend(text_chunks)
-
-    return [(c, m) for c, m in all_chunks if c]
+    '''
+    chunks = header_splitter.split_text(text)
+    for chunk in chunks:
+        chunk.metadata["source"] = source_name
+        print(chunk.metadata)
+        print(chunk.page_content)
+    #return header_splitter.split_text(text)  # Return header-split chunks without table handling for now
+    return chunks
 
 
 # --- DB helpers ---
@@ -408,7 +415,7 @@ def embed_file(collection, file_path, source_name):
         collection.add(
             ids=[f"{source_name}__{i}"],
             embeddings=[emb],
-            documents=[enriched_content],  # Store enriched content so search results include metadata
+            documents=[chunk_text_content],  # Store plain chunk text; enriched version used only for embedding
             metadatas=[clean_metadata]
         )
     return len(chunks)
@@ -560,29 +567,8 @@ def cmd_chunk(file_path):
     print(f"Chunks: {len(chunks)}  |  Splitter: {'markdown-aware' if is_markdown else 'plain text'}")
     print(f"{'='*50}\n")
     for i, chunk_data in enumerate(chunks, 1):
-        # Handle both markdown (tuple) and plain text (string) formats
-        if is_markdown and isinstance(chunk_data, tuple):
-            chunk_content, chunk_metadata = chunk_data
-            
-            # Build enriched chunk as it will be embedded
-            enriched_chunk = _build_enriched_chunk(chunk_content, chunk_metadata)
-            
-            # Build heading display string
-            heading_parts = []
-            if chunk_metadata.get("h1"):
-                heading_parts.append(chunk_metadata["h1"])
-            if chunk_metadata.get("h2"):
-                heading_parts.append(chunk_metadata["h2"])
-            if chunk_metadata.get("h3"):
-                heading_parts.append(chunk_metadata["h3"])
-            heading_str = " → ".join(heading_parts) if heading_parts else "(no heading)"
-            
-            print(f"--- Chunk {i}/{len(chunks)} | Headings: {heading_str} ---")
-            print(f"    [This is what will be embedded] ({len(enriched_chunk)} chars)")
-            print(enriched_chunk)
-        else:
-            print(f"--- Chunk {i}/{len(chunks)} ({len(chunk_data)} chars) ---")
-            print(chunk_data)
+        print(f"--- Chunk {i}/{len(chunks)} ({len(chunk_data.page_content)} chars) ---")
+        print(chunk_data)
         print()
         if i < len(chunks):
             answer = input("[Enter] next  [q] quit  [a] all > ").strip().lower()
@@ -590,31 +576,79 @@ def cmd_chunk(file_path):
                 break
             elif answer == "a":
                 for j, remaining_data in enumerate(chunks[i:], i + 1):
-                    if is_markdown and isinstance(remaining_data, tuple):
-                        remaining_content, remaining_metadata = remaining_data
-                        
-                        # Build enriched chunk as it will be embedded
-                        enriched_chunk = _build_enriched_chunk(remaining_content, remaining_metadata)
-                        
-                        # Build heading display string
-                        heading_parts = []
-                        if remaining_metadata.get("h1"):
-                            heading_parts.append(remaining_metadata["h1"])
-                        if remaining_metadata.get("h2"):
-                            heading_parts.append(remaining_metadata["h2"])
-                        if remaining_metadata.get("h3"):
-                            heading_parts.append(remaining_metadata["h3"])
-                        heading_str = " → ".join(heading_parts) if heading_parts else "(no heading)"
-                        
-                        print(f"--- Chunk {j}/{len(chunks)} | Headings: {heading_str} ---")
-                        print(f"    [This is what will be embedded] ({len(enriched_chunk)} chars)")
-                        print(enriched_chunk)
-                    else:
-                        print(f"--- Chunk {j}/{len(chunks)} ({len(remaining_data)} chars) ---")
-                        print(remaining_data)
+                    print(f"--- Chunk {j}/{len(chunks)} ({len(remaining_data.page_content)} chars) ---")
+                    print(remaining_data)
                     print()
                 break
     print(f"✓ {len(chunks)} chunks total from '{os.path.basename(file_path)}'.")
+
+
+def cmd_normalize(file_path):
+    """Normalize heading levels in a markdown file.
+    For numbered headings (e.g. '1 Title', '1.2 Sub', '1.2.3 Sub-sub'),
+    the depth is derived from the number of components (dots + 1).
+    For unnumbered headings, the level is kept relative to their position.
+    """
+    if not os.path.isfile(file_path):
+        print(f"File not found: {file_path}")
+        return
+    if not file_path.lower().endswith('.md'):
+        print(f"Only markdown (.md) files can be normalized.")
+        return
+    
+    print(f"Analyzing '{os.path.basename(file_path)}'...")
+    
+    with open(file_path, 'r', encoding='utf-8') as f:
+        lines = f.readlines()
+    
+    import re
+    heading_pattern = re.compile(r'^(#+)\s+(.+)$')
+    # Matches numbered headings: "1 Title", "1.2 Title", "1.2.3 Title", etc.
+    numbered_heading = re.compile(r'^(\d+(?:\.\d+)*)\s+\S')
+    
+    normalized_lines = []
+    changes = 0
+    
+    for line in lines:
+        match = heading_pattern.match(line)
+        if match:
+            old_hashes = match.group(1)
+            heading_text = match.group(2).rstrip()
+            old_level = len(old_hashes)
+            
+            num_match = numbered_heading.match(heading_text)
+            if num_match:
+                # Depth = number of dot-separated components
+                new_level = len(num_match.group(1).split('.'))
+            else:
+                # Unnumbered heading: keep its existing level
+                new_level = old_level
+            
+            new_level = min(new_level, 6)
+            new_hashes = '#' * new_level
+            new_line = f"{new_hashes} {heading_text}\n"
+            
+            if new_line != line:
+                changes += 1
+                print(f"  {old_hashes} {heading_text[:60]}  →  {new_hashes}")
+            
+            normalized_lines.append(new_line)
+        else:
+            normalized_lines.append(line)
+    
+    if changes == 0:
+        print(f"✓ No changes needed - headings already normalized.")
+        return
+    
+    answer = input(f"\nApply {changes} heading changes? [y/N] ").strip().lower()
+    if answer != "y":
+        print("Aborted.")
+        return
+    
+    with open(file_path, 'w', encoding='utf-8') as f:
+        f.writelines(normalized_lines)
+    
+    print(f"✓ Normalized {changes} headings in '{os.path.basename(file_path)}'.")
 
 
 def cmd_delete():
@@ -695,6 +729,7 @@ def run_repl():
     print("          /db delete       — delete the current database")
     print("          /list            — list indexed documents")
     print("          /convert <path>  — convert PDF/txt files to .md (supports *.pdf patterns)")
+    print("          /normalize <path>— normalize heading levels in markdown file")
     print("          /build           — embed .md files from <db>/")
     print("          /add <file>      — embed a specific .md file")
     print("          /add <file> debug — embed and show what will be stored")
@@ -740,6 +775,11 @@ def run_repl():
                     print("Aborted.")
         elif raw == "/convert":
             print("Usage: /convert <path>  (e.g., /convert docs/*.pdf or /convert docs/file.pdf)")
+        elif raw.startswith("/normalize "):
+            file_path = raw[11:].strip()
+            cmd_normalize(file_path)
+        elif raw == "/normalize":
+            print("Usage: /normalize <path>  (e.g., /normalize docs/file.md)")
         elif raw == "/build":
             cmd_build()
         elif raw.startswith("/add "):

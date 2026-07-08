@@ -5,6 +5,9 @@ import ollama
 import chromadb
 import os
 import logging
+import readline
+import atexit
+from pathlib import Path
 from datetime import datetime
 from sentence_transformers import CrossEncoder
 from rank_bm25 import BM25Okapi
@@ -123,24 +126,62 @@ def search(collection, question, top_n=10):
     return results
 
 # Query RAG
+def _build_context(top_docs_with_meta):
+    """Group chunks by document then section. Each document and section
+    appears exactly once, in order of first appearance in search results.
+    Section header shows only the parent levels:
+    - h3 chunk → "h1 > h2"
+    - h2 chunk → "h1"
+    - h1 chunk → no section header
+    """
+    SEP = "=" * 50
+    from collections import OrderedDict
+
+    # docs[source][section_key] = [chunks...]
+    # OrderedDict preserves insertion order → first-appearance order
+    docs = OrderedDict()
+
+    for doc, metadata in top_docs_with_meta:
+        source = metadata.get("source", "Unknown")
+        h1 = metadata.get("h1", "")
+        h2 = metadata.get("h2", "")
+        h3 = metadata.get("h3", "")
+
+        # section_key = the heading levels that will be DISPLAYED in the header.
+        # h3 chunk → show "h1 > h2" → key = (h1, h2)
+        # h2 chunk → show "h1"      → key = (h1,)
+        # h1 chunk → show "h1"      → key = (h1,)  ← same bucket as h2 chunks under same h1
+        if h3:
+            section_key = (h1, h2)
+        else:
+            section_key = (h1,) if h1 else ()
+
+        if source not in docs:
+            docs[source] = OrderedDict()
+        if section_key not in docs[source]:
+            docs[source][section_key] = []
+
+        docs[source][section_key].append(doc)
+
+    context_parts = []
+    for source, sections in docs.items():
+        doc_lines = [SEP, f"Document: {source}"]
+
+        for section_key, chunks in sections.items():
+            if section_key:
+                doc_lines.append(f"\nSection: {' > '.join(section_key)}")
+
+            doc_lines.extend(chunks)
+
+        context_parts.append("\n".join(doc_lines))
+
+    return "\n\n".join(context_parts)
+
+
 def ask(collection, question, chat_model):
     top_docs_with_meta = search(collection, question)
     
-    # Format context with source attribution and heading information
-    context_parts = []
-    for doc, metadata in top_docs_with_meta:
-        source = metadata.get("source", "Unknown source")
-        heading_path = metadata.get("heading_path", [])
-        
-        # Build context header with source and hierarchical headings
-        if heading_path:
-            heading_str = " > ".join(heading_path)
-            header = f"[Source: {source} | Section: {heading_str}]"
-        else:
-            header = f"[Source: {source}]"
-        
-        context_parts.append(f"{header}\n{doc}")
-    context = "\n\n".join(context_parts)
+    context = _build_context(top_docs_with_meta)
 
     # Log the question with context
     timestamp_q = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -234,9 +275,17 @@ if __name__ == "__main__":
         exit()
     
     print(f"✓ Selected chat model: {chat_model}")
-    print("\nCommands: /search <query>  —  return relevant sections only")
-    print("          /ask <query>    —  get an answer from the model")
-    print("          /quit           —  exit\n")
+    print("\nCommands: /search <query>   —  return relevant sections only")
+    print("          /context <query>  —  show the context that would be sent to the model")
+    print("          /ask <query>     —  get an answer from the model")
+    print("          /quit            —  exit\n")
+    
+    # Setup readline history (up arrow to access previous commands)
+    history_file = Path.home() / ".rag_ask_history"
+    if history_file.exists():
+        readline.read_history_file(history_file)
+    readline.set_history_length(100)
+    atexit.register(readline.write_history_file, history_file)
 
     while True:
         try:
@@ -267,10 +316,19 @@ if __name__ == "__main__":
                     print(f"\n--- Result {i} (Source: {source}) ---")
                 print(doc)
             print("=" * 117 + "\n")
+        elif raw.startswith("/context "):
+            query = raw[len("/context "):].strip()
+            docs_with_meta = search(collection, query)
+            context = _build_context(docs_with_meta)
+            print("\n" + "=" * 50 + " CONTEXT " + "=" * 50)
+            print(context)
+            print("=" * 50 + " END CONTEXT " + "=" * 50 + "\n")
+        elif raw == "/context":
+            print("Usage: /context <query>")
         elif raw.startswith("/ask "):
             query = raw[len("/ask "):].strip()
             print("\n" + "=" * 50 + " ANSWER " + "=" * 50)
             print(ask(collection, query, chat_model))
             print("=" * 108 + "\n")
         else:
-            print("Unknown command. Use /search <query>, /ask <query>, or /quit.")
+            print("Unknown command. Use /search <query>, /context <query>, /ask <query>, or /quit.")
