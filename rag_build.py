@@ -403,7 +403,7 @@ def embed_file(collection, file_path, source_name):
         collection.add(
             ids=[f"{source_name}__{i}"],
             embeddings=[emb],
-            documents=[chunk.page_content],  # Store plain chunk text; enriched version used only for embedding
+            documents=[enriched_content],  # Store plain chunk text; enriched version used only for embedding
             metadatas=[chunk.metadata]
         )
     return len(chunks)

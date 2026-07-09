@@ -32,15 +32,18 @@ reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 _bm25_cache = {"key": None, "bm25": None, "corpus": None}
 
 def get_bm25(collection):
-    key = collection.count()
-    if _bm25_cache["key"] != key:
-        result = collection.get(include=["documents"])
-        corpus = result["documents"]
-        tokenized = [doc.lower().split() for doc in corpus]
-        _bm25_cache["key"] = key
-        _bm25_cache["bm25"] = BM25Okapi(tokenized)
-        _bm25_cache["corpus"] = corpus
-    return _bm25_cache["bm25"], _bm25_cache["corpus"]
+    results = collection.get(
+        include=["documents", "metadatas"]
+    )
+
+    corpus = results["documents"]
+    corpus_meta = results["metadatas"]
+
+    tokenized = [doc.lower().split() for doc in corpus]
+
+    bm25 = BM25Okapi(tokenized)
+
+    return bm25, corpus, corpus_meta
 
 def reciprocal_rank_fusion(rankings, k=60):
     """Merge multiple ranked lists of docs into a single scored dict."""
@@ -110,31 +113,35 @@ def search(collection, question, top_n=10):
     vec_docs = vec_results["documents"][0]
     vec_meta = vec_results["metadatas"][0]
 
-    # Keep metadata attached to documents
-    vector_results = {
+    
+    # Store metadata lookup
+    metadata_lookup = {
         doc: meta
         for doc, meta in zip(vec_docs, vec_meta)
     }
 
-
     # ---------------------------------------------------------
     # 3. BM25 retrieval
     # ---------------------------------------------------------
-    bm25, corpus = get_bm25(collection)
+    bm25, corpus, corpus_meta = get_bm25(collection)
 
     tokens = question.lower().split()
 
     bm25_scores = bm25.get_scores(tokens)
 
-    bm25_docs = [
-        corpus[i]
-        for i in sorted(
-            range(len(bm25_scores)),
-            key=lambda i: bm25_scores[i],
-            reverse=True
-        )[:20]
-    ]
+    bm25_docs = []
 
+    for i in sorted(
+        range(len(bm25_scores)),
+        key=lambda i: bm25_scores[i],
+        reverse=True
+    )[:20]:
+        doc = corpus[i]
+        bm25_docs.append(doc)
+        
+        #Add BM25 metadata do lookup
+        metadata_lookup[doc] = corpus_meta[i]
+    
 
     # ---------------------------------------------------------
     # 4. Reciprocal Rank Fusion
@@ -177,7 +184,7 @@ def search(collection, question, top_n=10):
 
     for score, doc in ranked[:top_n]:
 
-        metadata = vector_results.get(
+        metadata = metadata_lookup.get(
             doc,
             {}
         )
@@ -266,7 +273,7 @@ def ask(collection, question, chat_model):
                 "content": f"Context:\n{context}\n\nQuestion:\n{question}"
             }
         ],
-        think=False
+        think=True
     )
 
     answer = response["message"]["content"]
