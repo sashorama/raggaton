@@ -257,104 +257,10 @@ def chunk_text(text, markdown=False, debug=False, source_name=None):
         strip_headers=False
     )
 
-    # FIRST: Apply header splitting to the entire document to preserve heading hierarchy
-    header_docs = header_splitter.split_text(text)
-    
-    # Match a table block: 2+ consecutive lines that start with '|'
-    table_pattern = re.compile(r'((?:^|\n)(?:\|[^\n]+\n){2,}\|[^\n]+)', re.MULTILINE)
 
-    #all_chunks = []
-    '''
-    # Track active headings as we process documents in order
-    active_headings = {"h1": None, "h2": None, "h3": None}
-
-    for doc_idx, doc in enumerate(header_docs):
-        # Update active headings based on this document's metadata
-        # Each document tells us what heading section it's in
-        if "h1" in doc.metadata:
-            new_h1 = doc.metadata["h1"]
-            if new_h1 != active_headings["h1"]:
-                active_headings["h1"] = new_h1
-                active_headings["h2"] = None
-                active_headings["h3"] = None
-        
-        if "h2" in doc.metadata:
-            new_h2 = doc.metadata["h2"]
-            if new_h2 != active_headings["h2"]:
-                active_headings["h2"] = new_h2
-                active_headings["h3"] = None
-        
-        if "h3" in doc.metadata:
-            new_h3 = doc.metadata["h3"]
-            if new_h3 != active_headings["h3"]:
-                active_headings["h3"] = new_h3
-        
-        if debug:
-            # Only show when there's new heading metadata
-            has_heading = any(doc.metadata.get(k) for k in ["h1", "h2", "h3"])
-            if has_heading:
-                print(f"  Doc {doc_idx}: metadata={doc.metadata}, active_headings now={active_headings}")
-        
-        # Build heading metadata dict with level info and document name
-        
-        heading_metadata = {
-            "h1": active_headings["h1"],
-            "h2": active_headings["h2"],
-            "h3": active_headings["h3"]
-        }
-        
-        # Add document information if provided
-        if source_name:
-            heading_metadata["source"] = source_name
-            heading_metadata["document"] = os.path.splitext(source_name)[0]
-        
-        # NOW: Split the document content by tables
-        # re.split with a capturing group yields [text, table, text, table, ...]
-        parts = table_pattern.split(doc.page_content)
-        
-        pending_tables = []  # tables waiting to be prepended to next chunk
-        text_chunks = []
-        
-        for i, part in enumerate(parts):
-            if i % 2 == 0:
-                # Text segment — chunk further with RecursiveCharacterTextSplitter
-                for chunk_content in splitter.split_text(part):
-                    if chunk_content.strip():
-                        text_chunks.append((chunk_content, heading_metadata.copy()))
-                
-                # Flush pending tables onto first text chunk
-                if text_chunks and pending_tables:
-                    content, hmeta = text_chunks[0]
-                    text_chunks[0] = ("\n\n".join(pending_tables) + "\n\n" + content, hmeta)
-                    pending_tables = []
-            else:
-                # Table segment — attach to last chunk or queue for next
-                table = part.strip()
-                if not table:
-                    continue
-                if text_chunks:
-                    content, hmeta = text_chunks[-1]
-                    text_chunks[-1] = (content + "\n\n" + table, hmeta)
-                else:
-                    pending_tables.append(table)
-
-        # Tables at end of this header section
-        if pending_tables:
-            if text_chunks:
-                content, hmeta = text_chunks[-1]
-                text_chunks[-1] = (content + "\n\n" + "\n\n".join(pending_tables), hmeta)
-            else:
-                # Table with no text under this heading — carry forward to next header section
-                for table in pending_tables:
-                    all_chunks.append((table, heading_metadata.copy()))
-        
-        all_chunks.extend(text_chunks)
-    '''
     chunks = header_splitter.split_text(text)
     for chunk in chunks:
         chunk.metadata["source"] = source_name
-        print(chunk.metadata)
-        print(chunk.page_content)
     #return header_splitter.split_text(text)  # Return header-split chunks without table handling for now
     return chunks
 
@@ -544,6 +450,8 @@ def cmd_build():
 
 
 def cmd_chunk(file_path):
+    folder = docs_folder()
+    file_path = os.path.join(folder, file_path)
     if not os.path.isfile(file_path):
         print(f"File not found: {file_path}")
         return
@@ -571,20 +479,18 @@ def cmd_chunk(file_path):
     print(f"✓ {len(chunks)} chunks total from '{os.path.basename(file_path)}'.")
 
 
-def cmd_normalize(file_path):
-    """Normalize heading levels in a markdown file.
-    For numbered headings (e.g. '1 Title', '1.2 Sub', '1.2.3 Sub-sub'),
-    the depth is derived from the number of components (dots + 1).
-    For unnumbered headings, the level is kept relative to their position.
+def _normalize_single_file(file_path):
+    """Normalize heading levels in a single markdown file.
+    Returns number of changes made, or -1 if file was skipped.
     """
     if not os.path.isfile(file_path):
-        print(f"File not found: {file_path}")
-        return
+        print(f"  ✗ File not found: {file_path}")
+        return -1
     if not file_path.lower().endswith('.md'):
-        print(f"Only markdown (.md) files can be normalized.")
-        return
+        print(f"  ✗ Only markdown (.md) files can be normalized.")
+        return -1
     
-    print(f"Analyzing '{os.path.basename(file_path)}'...")
+    print(f"  Analyzing '{os.path.basename(file_path)}'...")
     
     with open(file_path, 'r', encoding='utf-8') as f:
         lines = f.readlines()
@@ -618,25 +524,67 @@ def cmd_normalize(file_path):
             
             if new_line != line:
                 changes += 1
-                print(f"  {old_hashes} {heading_text[:60]}  →  {new_hashes}")
+                print(f"    {old_hashes} {heading_text[:60]}  →  {new_hashes}")
             
             normalized_lines.append(new_line)
         else:
             normalized_lines.append(line)
     
     if changes == 0:
-        print(f"✓ No changes needed - headings already normalized.")
-        return
-    
-    answer = input(f"\nApply {changes} heading changes? [y/N] ").strip().lower()
-    if answer != "y":
-        print("Aborted.")
-        return
+        print(f"  ✓ No changes needed")
+        return 0
     
     with open(file_path, 'w', encoding='utf-8') as f:
         f.writelines(normalized_lines)
     
-    print(f"✓ Normalized {changes} headings in '{os.path.basename(file_path)}'.")
+    print(f"  ✓ Applied {changes} heading change(s)")
+    return changes
+
+
+def cmd_normalize(file_path=None):
+    """Normalize heading levels in markdown file(s).
+    If file_path is None, normalize all .md files in docs_folder().
+    For numbered headings (e.g. '1 Title', '1.2 Sub', '1.2.3 Sub-sub'),
+    the depth is derived from the number of components (dots + 1).
+    For unnumbered headings, the level is kept relative to their position.
+    """
+    folder = docs_folder()
+    
+    # If no file_path given, normalize all .md files in the folder
+    if file_path is None:
+        md_files = sorted([f for f in os.listdir(folder) if f.endswith('.md')])
+        if not md_files:
+            print(f"No markdown files found in '{folder}'")
+            return
+        
+        print(f"Found {len(md_files)} markdown file(s) to normalize:")
+        for f in md_files:
+            print(f"  - {f}")
+        
+        confirm = input(f"\nNormalize all {len(md_files)} files? [y/N] ").strip().lower()
+        if confirm != "y":
+            print("Aborted.")
+            return
+        
+        print()
+        total_changes = 0
+        for md_file in md_files:
+            full_path = os.path.join(folder, md_file)
+            changes = _normalize_single_file(full_path)
+            if changes >= 0:
+                total_changes += changes
+        
+        print(f"\n✓ Completed: {total_changes} total change(s) applied across {len(md_files)} file(s).")
+    else:
+        # Single file normalization
+        full_path = os.path.join(folder, file_path)
+        print(f"Analyzing '{os.path.basename(full_path)}'...")
+        changes = _normalize_single_file(full_path)
+        if changes >= 0:
+            if changes > 0:
+                print(f"✓ Normalized {changes} headings in '{os.path.basename(full_path)}'.")
+            else:
+                print(f"✓ No changes needed - headings already normalized.")
 
 
 def cmd_delete():
@@ -717,7 +665,7 @@ def run_repl():
     print("          /db delete       — delete the current database")
     print("          /list            — list indexed documents")
     print("          /convert <path>  — convert PDF/txt files to .md (supports *.pdf patterns)")
-    print("          /normalize <path>— normalize heading levels in markdown file")
+    print("          /normalize [path]— normalize headings in all .md files (or specific file)")
     print("          /build           — embed .md files from <db>/")
     print("          /add <file>      — embed a specific .md file")
     print("          /add <file> debug — embed and show what will be stored")
@@ -767,7 +715,7 @@ def run_repl():
             file_path = raw[11:].strip()
             cmd_normalize(file_path)
         elif raw == "/normalize":
-            print("Usage: /normalize <path>  (e.g., /normalize docs/file.md)")
+            cmd_normalize()  # Normalize all .md files
         elif raw == "/build":
             cmd_build()
         elif raw.startswith("/add "):
