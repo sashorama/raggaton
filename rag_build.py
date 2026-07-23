@@ -1,7 +1,11 @@
+import os
+# Force HuggingFace to use only local cache — no network calls
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
 import ollama
 from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
 import chromadb
-import os
 from tqdm import tqdm
 import readline
 import atexit

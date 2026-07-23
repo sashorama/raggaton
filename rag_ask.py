@@ -1,10 +1,14 @@
 import warnings
 warnings.filterwarnings("ignore", message=".*unauthenticated.*")
 
+import os
+# Force HuggingFace to use only local cache — no network calls
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
 import re
 import ollama
 import chromadb
-import os
 import logging
 import readline
 import atexit
@@ -27,7 +31,7 @@ logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
 logging.getLogger("transformers").setLevel(logging.WARNING)
 logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 
-reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", local_files_only=True)
 
 # Cached BM25 index — rebuilt when the collection changes or tokenizer version bumps
 _TOKENIZER_VERSION = 2
@@ -312,7 +316,8 @@ def _build_context(top_chunks_with_meta):
         for section_key, chunks in sections.items():
             if section_key:
                 doc_lines.append(f"\nSection: {' > '.join(section_key)}")
-            doc_lines.append(chunks[0].get("document", ""))
+            for chunk in chunks:
+                doc_lines.append(chunk.get("document", ""))
             
         context_parts.append("\n".join(doc_lines))
     
