@@ -1,0 +1,965 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RAG Query</title>
+  <style>
+    :root {
+      --bg:               #0f1117;
+      --surface:          #1a1d27;
+      --border:           #2d3148;
+      --text:             #e2e8f0;
+      --muted:            #8892a4;
+      --accent:           #6366f1;
+      --accent-hover:     #818cf8;
+      --thinking-bg:      #1e1b30;
+      --thinking-border:  #4c3f82;
+      --answer-bg:        #0f2920;
+      --answer-border:    #2d6a4f;
+      --badge-vec:        #1e3a5f;
+      --badge-bm25:       #1e3f26;
+      --badge-both:       #3d2810;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      line-height: 1.6;
+    }
+
+    /* ── header ──────────────────────────────────────────────────────────── */
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 12px 24px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      flex-wrap: wrap;
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+
+    header h1 {
+      font-size: 1.05rem;
+      font-weight: 600;
+      color: var(--accent-hover);
+      margin-right: auto;
+    }
+
+    label { font-size: 0.82rem; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+
+    select {
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 5px 10px;
+      font-size: 0.82rem;
+      cursor: pointer;
+      max-width: 260px;
+    }
+    select:focus { outline: 2px solid var(--accent); }
+
+    /* ── main ────────────────────────────────────────────────────────────── */
+    main {
+      max-width: 920px;
+      margin: 0 auto;
+      padding: 24px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    /* ── query box ───────────────────────────────────────────────────────── */
+    .query-box {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    textarea {
+      width: 100%;
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 10px 12px;
+      font-size: 0.95rem;
+      font-family: inherit;
+      resize: vertical;
+      min-height: 72px;
+    }
+    textarea:focus { outline: 2px solid var(--accent); }
+
+    .buttons { display: flex; gap: 10px; align-items: center; }
+
+    button {
+      padding: 7px 20px;
+      border-radius: 6px;
+      border: none;
+      font-size: 0.88rem;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background 0.15s, border-color 0.15s;
+    }
+
+    #btn-ask   { background: var(--accent); color: #fff; }
+    #btn-ask:hover { background: var(--accent-hover); }
+
+    #btn-search {
+      background: transparent;
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    #btn-search:hover { border-color: var(--accent); color: var(--accent-hover); }
+
+    #btn-context {
+      background: transparent;
+      color: var(--muted);
+      border: 1px solid var(--border);
+    }
+    #btn-context:hover { border-color: var(--accent); color: var(--accent-hover); }
+
+    /* ── context modal ───────────────────────────────────────────────────── */
+    #ctx-modal {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.6);
+      z-index: 100;
+      align-items: flex-start;
+      justify-content: center;
+      padding: 40px 16px;
+    }
+    #ctx-modal.open { display: flex; }
+
+    #ctx-dialog {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      width: 100%;
+      max-width: 860px;
+      max-height: calc(100vh - 80px);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    #ctx-header {
+      display: flex;
+      align-items: center;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      gap: 10px;
+    }
+    #ctx-header h2 { font-size: 0.95rem; font-weight: 600; flex: 1; }
+    #ctx-close {
+      background: transparent;
+      border: none;
+      color: var(--muted);
+      font-size: 1.2rem;
+      cursor: pointer;
+      padding: 2px 6px;
+      border-radius: 4px;
+      line-height: 1;
+    }
+    #ctx-close:hover { color: var(--text); background: var(--border); }
+
+    #ctx-token-info {
+      font-size: 0.78rem;
+      color: var(--muted);
+      padding: 6px 16px;
+      border-bottom: 1px solid var(--border);
+      background: var(--bg);
+    }
+
+    #ctx-question {
+      font-size: 0.82rem;
+      color: var(--text);
+      background: var(--bg);
+      border-bottom: 1px solid var(--border);
+      padding: 8px 16px;
+      word-break: break-word;
+    }
+    #ctx-question strong { color: var(--muted); font-weight: 500; margin-right: 6px; }
+
+    #ctx-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 14px 16px;
+      font-size: 0.82rem;
+      color: var(--text);
+      line-height: 1.6;
+    }
+
+    /* ── context structure ───────────────────────────────────────────────── */
+    .ctx-sep  { border-top: 2px solid var(--border); margin: 14px 0 8px; }
+    .ctx-doc  { font-weight: 700; color: var(--accent-hover); font-size: 0.88rem; margin: 4px 0 2px; word-break: break-word; }
+    .ctx-section { color: var(--muted); font-size: 0.78rem; font-style: italic; margin-bottom: 6px; }
+    .ctx-chunk { color: var(--text); }
+
+    /* ── rendered markdown ───────────────────────────────────────────────── */
+    .md-rendered { white-space: normal; }
+    .md-rendered h1, .md-rendered h2, .md-rendered h3,
+    .md-rendered h4, .md-rendered h5, .md-rendered h6 {
+      color: var(--text); font-weight: 600; margin: 0.9em 0 0.35em; line-height: 1.3;
+    }
+    .md-rendered h1 { font-size: 1.25em; border-bottom: 1px solid var(--border); padding-bottom: 0.2em; }
+    .md-rendered h2 { font-size: 1.1em; }
+    .md-rendered h3 { font-size: 1.0em; }
+    .md-rendered h4, .md-rendered h5, .md-rendered h6 { font-size: 0.93em; color: var(--muted); }
+    .md-rendered p  { margin: 0.35em 0; }
+    .md-rendered ul, .md-rendered ol { padding-left: 1.6em; margin: 0.3em 0; }
+    .md-rendered li { margin: 0.15em 0; }
+    .md-rendered pre {
+      background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+      padding: 10px 14px; overflow-x: auto; margin: 0.6em 0; white-space: pre;
+    }
+    .md-rendered pre code { background: none; padding: 0; font-size: 0.82em; font-family: ui-monospace, monospace; }
+    .md-rendered code { background: var(--bg); padding: 1px 5px; border-radius: 3px; font-size: 0.85em; font-family: ui-monospace, monospace; }
+    .md-rendered hr { border: none; border-top: 1px solid var(--border); margin: 0.8em 0; }
+    .md-rendered blockquote { border-left: 3px solid var(--border); padding-left: 10px; color: var(--muted); margin: 0.4em 0; }
+
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+    #hint { font-size: 0.75rem; color: var(--muted); margin-left: auto; }
+
+    /* ── spinner ─────────────────────────────────────────────────────────── */
+    .spinner {
+      display: inline-block;
+      width: 13px; height: 13px;
+      border: 2px solid rgba(255,255,255,0.25);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      vertical-align: middle;
+      margin-right: 5px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── status bar ──────────────────────────────────────────────────────── */
+    #status-bar { font-size: 0.8rem; color: var(--muted); min-height: 18px; }
+
+    /* ── collapsible panel ───────────────────────────────────────────────── */
+    .panel { display: none; flex-direction: column; }
+    .panel.visible { display: flex; }
+
+    .panel-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 14px;
+      cursor: pointer;
+      user-select: none;
+      border-radius: 8px 8px 0 0;
+      font-size: 0.85rem;
+    }
+    .panel-header .chevron { transition: transform 0.2s; margin-left: auto; }
+    .panel-header .chevron.open { transform: rotate(180deg); }
+
+    /* ── thinking ────────────────────────────────────────────────────────── */
+    #sec-thinking .panel-header {
+      background: var(--thinking-bg);
+      border: 1px solid var(--thinking-border);
+      color: var(--muted);
+    }
+    #sec-thinking .panel-header:hover { color: var(--text); }
+
+    #thinking-body {
+      background: var(--thinking-bg);
+      border: 1px solid var(--thinking-border);
+      border-top: none;
+      border-radius: 0 0 8px 8px;
+      padding: 12px 14px;
+      font-size: 0.78rem;
+      color: var(--muted);
+      white-space: pre-wrap;
+      max-height: 220px;
+      overflow-y: auto;
+      display: none;
+    }
+    #thinking-body.open { display: block; }
+
+    /* ── answer ──────────────────────────────────────────────────────────── */
+    #answer-box {
+      background: var(--answer-bg);
+      border: 1px solid var(--answer-border);
+      border-radius: 8px;
+      padding: 16px 18px;
+      white-space: pre-wrap;
+      font-size: 0.93rem;
+      line-height: 1.75;
+    }
+
+    /* ── sources ─────────────────────────────────────────────────────────── */
+    #sec-sources .panel-header {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      font-weight: 500;
+      font-size: 0.88rem;
+    }
+    #sec-sources .panel-header:hover { border-color: var(--accent); }
+
+    #sources-list {
+      border: 1px solid var(--border);
+      border-top: none;
+      border-radius: 0 0 8px 8px;
+      overflow: hidden;
+      display: none;
+    }
+
+    .source-item { border-bottom: 1px solid var(--border); }
+    .source-item:last-child { border-bottom: none; }
+
+    .source-summary {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 9px 14px;
+      cursor: pointer;
+      background: var(--surface);
+      font-size: 0.82rem;
+    }
+    .source-summary:hover { background: var(--border); }
+
+    .source-name {
+      font-weight: 500;
+      flex: 1;
+      min-width: 120px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      max-width: 320px;
+    }
+
+    .source-section {
+      color: var(--muted);
+      font-size: 0.75rem;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 240px;
+    }
+
+    .badge {
+      font-size: 0.68rem;
+      padding: 2px 6px;
+      border-radius: 4px;
+      white-space: nowrap;
+      font-family: ui-monospace, monospace;
+    }
+    .badge-vector { background: var(--badge-vec);  color: #93c5fd; }
+    .badge-bm25   { background: var(--badge-bm25); color: #86efac; }
+    .badge-both   { background: var(--badge-both); color: #fcd34d; }
+    .badge-score  { background: transparent; color: var(--muted); border: 1px solid var(--border); }
+
+    .source-detail {
+      display: none;
+      background: var(--bg);
+      padding: 12px 14px;
+      font-size: 0.8rem;
+      color: var(--muted);
+      white-space: pre-wrap;
+      border-top: 1px solid var(--border);
+      max-height: 260px;
+      overflow-y: auto;
+      font-family: ui-monospace, monospace;
+    }
+    .source-detail.open { display: block; }
+
+    /* ── markdown tables ─────────────────────────────────────────────────── */
+    .table-wrapper { overflow-x: auto; margin: 10px 0; }
+
+    .md-table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: 0.85rem;
+      white-space: normal;
+      font-family: system-ui, -apple-system, sans-serif;
+    }
+
+    .md-table th,
+    .md-table td {
+      border: 1px solid var(--border);
+      padding: 6px 12px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    .md-table th {
+      background: var(--surface);
+      color: var(--text);
+      font-weight: 600;
+    }
+
+    .md-table tr:nth-child(even) td { background: rgba(255,255,255,0.02); }
+    .md-table td { color: var(--muted); }
+    .md-table code { background: var(--bg); padding: 1px 4px; border-radius: 3px; font-size: 0.82em; }
+
+    /* source detail stays monospace pre-wrap for raw chunk inspection */
+    .source-detail { white-space: pre-wrap; }
+    /* answer-box uses pre-wrap while streaming, md-rendered overrides after done */
+    #answer-box { white-space: pre-wrap; }
+    #answer-box.md-rendered { white-space: normal; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>RAG Query Interface</h1>
+  <label>Collection
+    <select id="sel-collection"><option value="">Loading…</option></select>
+  </label>
+  <label>Model
+    <select id="sel-model"><option value="">Loading…</option></select>
+  </label>
+</header>
+
+<main>
+  <!-- Query input -->
+  <div class="query-box">
+    <textarea id="question" placeholder="Ask a question about your documents… (Ctrl+Enter to ask)"></textarea>
+    <div class="buttons">
+      <button id="btn-ask">Ask</button>
+      <button id="btn-search">Search</button>
+      <button id="btn-context">Context</button>
+      <span id="hint">Ctrl+Enter → Ask</span>
+    </div>
+  </div>
+
+  <div id="status-bar"></div>
+
+  <!-- Thinking (collapsible) -->
+  <div class="panel" id="sec-thinking">
+    <div class="panel-header" id="thinking-toggle">
+      <span>💭 Thinking</span>
+      <span class="chevron" id="thinking-chevron">▼</span>
+    </div>
+    <div id="thinking-body"></div>
+  </div>
+
+  <!-- Answer -->
+  <div class="panel" id="sec-answer">
+    <div id="answer-box"></div>
+  </div>
+
+  <!-- Context modal -->
+  <div id="ctx-modal" role="dialog" aria-modal="true" aria-labelledby="ctx-title">
+    <div id="ctx-dialog">
+      <div id="ctx-header">
+        <h2 id="ctx-title">LLM Context</h2>
+        <button id="ctx-close" title="Close">✕</button>
+      </div>
+      <div id="ctx-question"></div>
+      <div id="ctx-token-info"></div>
+      <div id="ctx-body" class="md-rendered">Loading…</div>
+    </div>
+  </div>
+
+  <!-- Sources (collapsible) -->
+  <div class="panel" id="sec-sources">
+    <div class="panel-header" id="sources-toggle">
+      <span id="sources-label">Sources</span>
+      <span class="chevron" id="sources-chevron">▼</span>
+    </div>
+    <div id="sources-list"></div>
+  </div>
+</main>
+
+<script>
+  const $ = id => document.getElementById(id);
+
+  // ── markdown rendering ────────────────────────────────────────────────────
+
+  function isTableLine(line) {
+    const t = line.trim();
+    return t.startsWith('|') && t.length > 1;
+  }
+
+  function isTableSeparator(line) {
+    return /^\s*\|(\s*:?-+:?\s*\|)+\s*$/.test(line);
+  }
+
+  function inlineMd(text) {
+    let s = esc(text);
+    s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    s = s.replace(/\*([^*]+)\*/g,     '<em>$1</em>');
+    s = s.replace(/`([^`]+)`/g,       '<code>$1</code>');
+    return s;
+  }
+
+  function parseTable(lines) {
+    const parseRow = l =>
+      l.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|').map(c => c.trim());
+
+    const dataLines = lines.filter(l => !isTableSeparator(l));
+    if (!dataLines.length) return '';
+
+    const [hdr, ...body] = dataLines;
+    const headers = parseRow(hdr);
+    const thead = `<thead><tr>${headers.map(h => `<th>${inlineMd(h)}</th>`).join('')}</tr></thead>`;
+    const tbody = body.length
+      ? `<tbody>${body.map(l => `<tr>${parseRow(l).map(c => `<td>${inlineMd(c)}</td>`).join('')}</tr>`).join('')}</tbody>`
+      : '';
+    return `<div class="table-wrapper"><table class="md-table">${thead}${tbody}</table></div>`;
+  }
+
+  function renderMarkdown(text) {
+    if (!text) return '';
+    const lines = text.split('\n');
+    let html = '';
+    let i = 0;
+    let inList = null;      // 'ul' | 'ol' | null
+    let inCodeBlock = false;
+    let codeLang = '';
+    let codeLines = [];
+    let paraLines = [];
+
+    const closePara = () => {
+      if (!paraLines.length) return;
+      html += `<p>${paraLines.join('<br>')}</p>`;
+      paraLines = [];
+    };
+    const closeList = () => {
+      if (inList) { html += `</${inList}>`; inList = null; }
+    };
+    const closeBlocks = () => { closePara(); closeList(); };
+
+    while (i < lines.length) {
+      const raw  = lines[i];
+      const line = raw.trim();
+
+      // code fence
+      if (line.startsWith('```')) {
+        if (!inCodeBlock) {
+          closeBlocks();
+          inCodeBlock = true;
+          codeLang = line.slice(3).trim();
+          codeLines = [];
+        } else {
+          inCodeBlock = false;
+          const la = codeLang ? ` class="language-${esc(codeLang)}"` : '';
+          html += `<pre><code${la}>${esc(codeLines.join('\n'))}</code></pre>`;
+          codeLines = []; codeLang = '';
+        }
+        i++; continue;
+      }
+      if (inCodeBlock) { codeLines.push(raw); i++; continue; }
+
+      // table
+      if (isTableLine(raw)) {
+        closeBlocks();
+        const block = [];
+        while (i < lines.length && (isTableLine(lines[i]) || isTableSeparator(lines[i]))) {
+          block.push(lines[i++]);
+        }
+        html += block.some(isTableSeparator) ? parseTable(block) : block.map(l => inlineMd(l)).join('\n');
+        continue;
+      }
+
+      // heading
+      const hm = line.match(/^(#{1,6})\s+(.+)$/);
+      if (hm) {
+        closeBlocks();
+        html += `<h${hm[1].length}>${inlineMd(hm[2])}</h${hm[1].length}>`;
+        i++; continue;
+      }
+
+      // horizontal rule
+      if (/^(\*{3,}|-{3,}|_{3,})$/.test(line)) {
+        closeBlocks();
+        html += '<hr>';
+        i++; continue;
+      }
+
+      // blockquote
+      if (line.startsWith('> ')) {
+        closeBlocks();
+        html += `<blockquote>${inlineMd(line.slice(2))}</blockquote>`;
+        i++; continue;
+      }
+
+      // unordered list
+      const ulm = line.match(/^[-*+]\s+(.*)$/);
+      if (ulm) {
+        closePara();
+        if (inList !== 'ul') { closeList(); html += '<ul>'; inList = 'ul'; }
+        html += `<li>${inlineMd(ulm[1])}</li>`;
+        i++; continue;
+      }
+
+      // ordered list
+      const olm = line.match(/^\d+[.)]\s+(.*)$/);
+      if (olm) {
+        closePara();
+        if (inList !== 'ol') { closeList(); html += '<ol>'; inList = 'ol'; }
+        html += `<li>${inlineMd(olm[1])}</li>`;
+        i++; continue;
+      }
+
+      // blank line
+      if (!line) { closeBlocks(); i++; continue; }
+
+      // regular text → paragraph
+      closeList();
+      paraLines.push(inlineMd(raw));
+      i++;
+    }
+
+    closeBlocks();
+    if (inCodeBlock) html += `<pre><code>${esc(codeLines.join('\n'))}</code></pre>`;
+    return html;
+  }
+
+  // ── context renderer ──────────────────────────────────────────────────────
+
+  function renderContext(text) {
+    if (!text) return '';
+    let html = '';
+    let chunkLines = [];
+
+    const flushChunk = () => {
+      const s = chunkLines.join('\n').trim();
+      if (s) html += `<div class="ctx-chunk md-rendered">${renderMarkdown(s)}</div>`;
+      chunkLines = [];
+    };
+
+    for (const line of text.split('\n')) {
+      const t = line.trim();
+      if (/^={10,}$/.test(t)) {
+        flushChunk();
+        html += '<div class="ctx-sep"></div>';
+      } else if (t.startsWith('Document: ')) {
+        flushChunk();
+        html += `<div class="ctx-doc">${esc(t.slice(10))}</div>`;
+      } else if (t.startsWith('Section: ')) {
+        flushChunk();
+        html += `<div class="ctx-section">${esc(t.slice(9))}</div>`;
+      } else {
+        chunkLines.push(line);
+      }
+    }
+    flushChunk();
+    return html;
+  }
+
+  // ── initialise selectors ──────────────────────────────────────────────────
+
+  async function init() {
+    const [modelsData, colsData] = await Promise.all([
+      fetch('/models').then(r => r.json()).catch(() => ({ models: [] })),
+      fetch('/collections').then(r => r.json()).catch(() => ({ collections: [] })),
+    ]);
+
+    populateSelect($('sel-model'),      modelsData.models);
+    populateSelect($('sel-collection'), colsData.collections);
+  }
+
+  function populateSelect(sel, items) {
+    sel.innerHTML = '';
+    if (!items.length) {
+      sel.innerHTML = '<option value="">None found</option>';
+      return;
+    }
+    for (const item of items) {
+      const opt = document.createElement('option');
+      opt.value = opt.textContent = item;
+      sel.appendChild(opt);
+    }
+  }
+
+  init();
+
+  // ── collapsible panels ────────────────────────────────────────────────────
+
+  function togglePanel(bodyEl, chevronEl) {
+    const open = bodyEl.classList.toggle('open');
+    chevronEl.classList.toggle('open', open);
+  }
+
+  $('thinking-toggle').addEventListener('click', () =>
+    togglePanel($('thinking-body'), $('thinking-chevron'))
+  );
+
+  $('sources-toggle').addEventListener('click', () => {
+    const list = $('sources-list');
+    const open = list.style.display !== 'none';
+    list.style.display = open ? 'none' : 'block';
+    $('sources-chevron').classList.toggle('open', !open);
+  });
+
+  // ── utilities ─────────────────────────────────────────────────────────────
+
+  function setLoading(on) {
+    $('btn-ask').disabled = on;
+    $('btn-search').disabled = on;
+  }
+
+  function setStatus(html) { $('status-bar').innerHTML = html; }
+
+  function showPanel(id)   { $(id).classList.add('visible'); }
+  function hidePanel(id)   { $(id).classList.remove('visible'); }
+
+  function reset() {
+    ['sec-thinking', 'sec-answer', 'sec-sources'].forEach(hidePanel);
+    $('thinking-body').textContent = '';
+    $('thinking-body').classList.remove('open');
+    $('thinking-chevron').classList.remove('open');
+    $('answer-box').textContent = '';
+    $('answer-box').classList.remove('md-rendered');
+    $('sources-list').innerHTML = '';
+    $('sources-list').style.display = 'none';
+  }
+
+  function esc(str) {
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+  }
+
+  function sourceBadge(type) {
+    if (type === 'vector + bm25') return ['badge-both',   type];
+    if (type === 'bm25')          return ['badge-bm25',   type];
+    return                               ['badge-vector', type];
+  }
+
+  // ── render sources list ───────────────────────────────────────────────────
+
+  function renderSources(sources) {
+    showPanel('sec-sources');
+    $('sources-label').textContent = `Sources (${sources.length})`;
+    $('sources-list').style.display = 'block';
+    $('sources-chevron').classList.add('open');
+
+    const list = $('sources-list');
+    list.innerHTML = '';
+
+    sources.forEach((s, idx) => {
+      const scores = [];
+      if (s.vec_score  != null) scores.push(`vec=${s.vec_score.toFixed(4)}`);
+      if (s.bm25_score != null) scores.push(`bm25=${s.bm25_score.toFixed(4)}`);
+      if (s.score      != null) scores.push(`rerank=${s.score.toFixed(4)}`);
+
+      const [badgeClass, badgeLabel] = sourceBadge(s.sources_type);
+      const scoreBadges = scores.map(sc => `<span class="badge badge-score">${esc(sc)}</span>`).join('');
+      const sectionHtml = s.section
+        ? `<span class="source-section" title="${esc(s.section)}">${esc(s.section)}</span>`
+        : '';
+
+      const item = document.createElement('div');
+      item.className = 'source-item';
+      item.innerHTML = `
+        <div class="source-summary">
+          <span class="badge ${badgeClass}">${esc(badgeLabel)}</span>
+          <span class="source-name" title="${esc(s.source)}">${esc(s.source)}</span>
+          ${sectionHtml}
+          ${scoreBadges}
+          <span class="chevron" style="margin-left:auto">▼</span>
+        </div>
+        <div class="source-detail" id="detail-${idx}">${renderMarkdown(s.document)}</div>
+      `;
+
+      item.querySelector('.source-summary').addEventListener('click', () => {
+        const detail  = $(`detail-${idx}`);
+        const chevron = item.querySelector('.chevron');
+        detail.classList.toggle('open');
+        chevron.classList.toggle('open');
+      });
+
+      list.appendChild(item);
+    });
+  }
+
+  // ── Ask (streaming) ───────────────────────────────────────────────────────
+
+  $('btn-ask').addEventListener('click', async () => {
+    const question  = $('question').value.trim();
+    const model     = $('sel-model').value;
+    const collection = $('sel-collection').value;
+
+    if (!question)   { setStatus('Enter a question first.'); return; }
+    if (!model)      { setStatus('Select a model.'); return; }
+    if (!collection) { setStatus('Select a collection.'); return; }
+
+    reset();
+    setLoading(true);
+    setStatus('<span class="spinner"></span> Searching…');
+
+    let thinkingStarted = false;
+    let answerStarted   = false;
+    let answerText      = '';
+
+    try {
+      const res = await fetch('/ask', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question, model, collection }),
+      });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        setStatus(`Error: ${err.detail || res.statusText}`);
+        return;
+      }
+
+      setStatus('<span class="spinner"></span> Generating answer…');
+
+      const reader  = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split('\n');
+        buf = lines.pop(); // keep incomplete line
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          let event;
+          try { event = JSON.parse(line); } catch { continue; }
+
+          if (event.type === 'sources') {
+            renderSources(event.sources);
+
+          } else if (event.type === 'thinking') {
+            if (!thinkingStarted) {
+              showPanel('sec-thinking');
+              $('thinking-body').classList.add('open');
+              $('thinking-chevron').classList.add('open');
+              thinkingStarted = true;
+            }
+            $('thinking-body').textContent += event.content;
+            // auto-scroll thinking
+            $('thinking-body').scrollTop = $('thinking-body').scrollHeight;
+
+          } else if (event.type === 'answer') {
+            if (!answerStarted) {
+              showPanel('sec-answer');
+              answerStarted = true;
+              setStatus('');
+            }
+            answerText += event.content;
+            // plain text while streaming for smooth scroll, markdown on done
+            $('answer-box').textContent = answerText;
+
+          } else if (event.type === 'error') {
+            setStatus(`Error: ${event.content}`);
+
+          } else if (event.type === 'done') {
+            setStatus('');
+            // re-render accumulated answer with full markdown
+            if (answerText) {
+              $('answer-box').innerHTML = renderMarkdown(answerText);
+              $('answer-box').classList.add('md-rendered');
+            }
+          }
+        }
+      }
+    } catch (e) {
+      setStatus(`Error: ${e.message}`);
+    } finally {
+      setLoading(false);
+    }
+  });
+
+  // ── Search (no LLM) ───────────────────────────────────────────────────────
+
+  $('btn-search').addEventListener('click', async () => {
+    const question   = $('question').value.trim();
+    const collection = $('sel-collection').value;
+
+    if (!question)   { setStatus('Enter a question first.'); return; }
+    if (!collection) { setStatus('Select a collection.'); return; }
+
+    reset();
+    setLoading(true);
+    setStatus('<span class="spinner"></span> Searching…');
+
+    try {
+      const res = await fetch('/search', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question, collection }),
+      });
+      const data = await res.json();
+      if (!res.ok) { setStatus(`Error: ${data.detail || res.statusText}`); return; }
+      renderSources(data.results);
+      setStatus('');
+    } catch (e) {
+      setStatus(`Error: ${e.message}`);
+    } finally {
+      setLoading(false);
+    }
+  });
+
+  // ── Context button ──────────────────────────────────────────────────────
+
+  $('btn-context').addEventListener('click', async () => {
+    const question   = $('question').value.trim();
+    const collection = $('sel-collection').value;
+
+    if (!question)   { setStatus('Enter a question first.'); return; }
+    if (!collection) { setStatus('Select a collection.'); return; }
+
+    $('ctx-body').innerHTML = '<span style="color:var(--muted)">Loading…</span>';
+    $('ctx-token-info').textContent = '';
+    $('ctx-question').innerHTML = `<strong>Question:</strong>${esc(question)}`;
+    $('ctx-modal').classList.add('open');
+
+    try {
+      const res = await fetch('/context', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question, collection }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        $('ctx-body').textContent = `Error: ${data.detail || res.statusText}`;
+        return;
+      }
+      const ctx = data.context;
+      // rough token estimate: ~4 chars per token
+      const estTokens = Math.round(ctx.length / 4).toLocaleString();
+      const chars = ctx.length.toLocaleString();
+      $('ctx-token-info').textContent = `${chars} chars · ~${estTokens} tokens (rough estimate)`;
+      $('ctx-body').innerHTML = renderContext(ctx);
+    } catch (e) {
+      $('ctx-body').textContent = `Error: ${e.message}`;
+    }
+  });
+
+  $('ctx-close').addEventListener('click', () => $('ctx-modal').classList.remove('open'));
+  $('ctx-modal').addEventListener('click', e => {
+    if (e.target === $('ctx-modal')) $('ctx-modal').classList.remove('open');
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') $('ctx-modal').classList.remove('open');
+  });
+
+  // ── keyboard shortcut ─────────────────────────────────────────────────────
+
+  $('question').addEventListener('keydown', e => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      $('btn-ask').click();
+    }
+  });
+</script>
+</body>
+</html>
